@@ -8,9 +8,10 @@ With Homebrew:
 
 ```sh
 brew tap threadedstack/wmd
-brew trust threadedstack/wmd
 brew install wmd
 ```
+
+On Homebrew 7 and later, run `brew trust threadedstack/wmd` once after `brew tap`: newer Homebrew loads a third-party tap only after you trust it. Older Homebrew has no `brew trust` command and does not need it.
 
 Or with the install script, into `~/.wmd/bin`:
 
