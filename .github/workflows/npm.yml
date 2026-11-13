@@ -1,0 +1,76 @@
+# Publishes wmd's npm packages for every release of threadedstack/wmd-releases. Installed as
+# .github/workflows/npm.yml of that repository by wmd's scripts/release.sh (source: npm/npm.yml of threadedstack/wmd).
+#
+# A published release starts it; `gh workflow run npm.yml -R threadedstack/wmd-releases -f tag=vX.Y.Z` runs it again
+# for one tag. It downloads the release's files, checks them against SHA256SUMS.txt, packs
+# @threadedstack/wmd-darwin-arm64, @threadedstack/wmd-web and @threadedstack/wmd with npm/pack.mjs,
+# installs them on a Mac with Apple silicon and runs `wmd --version` from them, and publishes each version not on npm
+# yet. npm trusts this workflow (trusted publishing): no npm token is stored anywhere.
+name: npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  publish:
+    runs-on: macos-15
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # a release packs with npm/pack.mjs of its own tag; a run by hand with that of the branch it runs on (older tags
+      # have no npm/ folder)
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: npm 11.5.1 or later (trusted publishing)
+        run: npm install -g npm@11.21.2 && npm --version
+      - name: download the release
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag $TAG is not vX.Y.Z"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/assets"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/assets"
+          (cd "$RUNNER_TEMP/assets" && shasum -a 256 -c SHA256SUMS.txt)
+          commit=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json body --jq .body | sed -n 's/^commit: \([0-9a-f]\{40\}\)$/\1/p' | head -1)
+          [ -n "$commit" ] || { echo "the release notes name no commit"; exit 1; }
+          echo "COMMIT=$commit" >> "$GITHUB_ENV"
+      - name: pack
+        run: node npm/pack.mjs --assets "$RUNNER_TEMP/assets" --tag "$TAG" --commit "$COMMIT" --out "$RUNNER_TEMP/npm"
+      - name: install and run them
+        run: |
+          d=$RUNNER_TEMP/try && mkdir -p "$d" && cd "$d" && npm init -y >/dev/null
+          npm install --no-audit --no-fund "$RUNNER_TEMP"/npm/*.tgz
+          out=$(npx wmd --version) && echo "$out"
+          [[ "$out" == *"build ${COMMIT:0:8}"* ]] || { echo "wmd --version does not name ${COMMIT:0:8}"; exit 1; }
+          node --input-type=module -e "
+            const m = await import('@threadedstack/wmd')
+            const { existsSync } = await import('node:fs')
+            for (const p of m.PROGRAMS) if (!existsSync(m.binPath(p))) throw new Error(p)
+            for (const g of ['vm.wasm', 'Image', 'Image-4k', 'initramfs.cpio.gz']) if (!existsSync(m.guestDir() + '/' + g)) throw new Error(g)
+            for (const f of ['@threadedstack/wmd-web', '@threadedstack/wmd-web/wmdpack.wasm', '@threadedstack/wmd-web/relay/relay.ts', '@threadedstack/wmd-web/guest/arm64/vm.wasm'])
+              if (!existsSync(new URL(import.meta.resolve(f)))) throw new Error(f)
+            console.log('all programs, guest files and web files are there')"
+      - name: publish
+        run: |
+          cd "$RUNNER_TEMP/npm"
+          for f in $(node -e "for (const p of require('./packages.json')) console.log(p.name + '@' + p.version + ' ' + p.file)" | tr ' ' ':'); do
+            spec=${f%%:*}; file=${f#*:}
+            if npm view "$spec" version >/dev/null 2>&1; then echo "$spec is already on npm"; continue; fi
+            npm publish "./$file" --access public --provenance
+          done
