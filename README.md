@@ -19,6 +19,15 @@ Or with the install script, into `~/.wmd/bin`:
 curl -fsSL https://github.com/threadedstack/wmd-releases/releases/latest/download/install.sh | sh
 ```
 
+Or with npm (the same files, as packages; npm installs the macOS arm64 build on a Mac with Apple silicon):
+
+```sh
+npm install @threadedstack/wmd        # the wmd, wmdd and wmd-relay commands; binPath(), guestDir() for scripts
+npm install @threadedstack/wmd-web    # the browser host: src/boot.js, the guest, wmdpack.wasm, the relay
+```
+
+Every release is published to npm by this repository's `npm` workflow (`.github/workflows/npm.yml`) once the release is published, with provenance.
+
 Then run `wmd setup` once to start the daemon at login and add a `wmd` docker context.
 
 ## What a release holds
