@@ -27,6 +27,7 @@ concurrency:
 jobs:
   publish:
     runs-on: macos-15
+    timeout-minutes: 180
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
       GH_TOKEN: ${{ github.token }}
@@ -73,4 +74,9 @@ jobs:
             spec=${f%%:*}; file=${f#*:}
             if npm view "$spec" version >/dev/null 2>&1; then echo "$spec is already on npm"; continue; fi
             npm publish "./$file" --access public --provenance
+            # npm takes minutes to make a large package public (the platform package: about 10); @threadedstack/wmd is
+            # published only once its platform package can be installed, or an install in between would skip it
+            for i in $(seq 1 120); do npm view "$spec" version --prefer-online >/dev/null 2>&1 && break; sleep 30; done
+            npm view "$spec" version --prefer-online >/dev/null 2>&1 || { echo "$spec is still not on npm after 60 minutes"; exit 1; }
+            echo "$spec is on npm"
           done
