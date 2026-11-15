@@ -19,18 +19,46 @@ export const PROGRAMS = ['wmd', 'wmdd', 'wmd-run', 'wmd-relay', 'wmd-exe-stub', 
 export const version = self.version
 export const commit = self.wmd?.commit ?? ''
 
-/** The platform package's name for this machine, e.g. @threadedstack/wmd-darwin-arm64. */
-export function platformPackage(platform = process.platform, arch = process.arch) {
-  return `@threadedstack/wmd-${platform}-${arch}`
+/** The guest architecture of a cpu (default: this machine's): arm64, or amd64 for x64; throws for any other. */
+export function hostGuestArch(arch = process.arch) {
+  if (arch === 'x64') return 'amd64'
+  if (arch === 'arm64') return 'arm64'
+  throw new Error(`wmd: no guest for cpu ${arch}; there is one for arm64 and x64`)
+}
+
+let report
+/** The process report, read once (it is slow); without the network part. */
+function processReport() {
+  if (report === undefined) {
+    const was = process.report?.excludeNetwork
+    try {
+      if (process.report) process.report.excludeNetwork = true
+      report = process.report?.getReport?.() ?? null
+    } finally {
+      if (process.report) process.report.excludeNetwork = was
+    }
+  }
+  return report
+}
+
+/** The C library of this Linux: 'glibc' or 'musl'; null on another os. A glibc process reports its version. */
+export function hostLibc(platform = process.platform, getReport = processReport) {
+  if (platform !== 'linux') return null
+  return getReport()?.header?.glibcVersionRuntime ? 'glibc' : 'musl'
+}
+
+/** The platform package's name, e.g. @threadedstack/wmd-darwin-arm64; the Linux musl ones end in -musl. */
+export function platformPackage(platform = process.platform, arch = process.arch, libc = hostLibc()) {
+  return `@threadedstack/wmd-${platform}-${arch}${platform === 'linux' && libc === 'musl' ? '-musl' : ''}`
 }
 
 /** The bin folder of this machine's platform package; throws, naming what to install, when there is none. */
-export function binDir() {
-  const name = platformPackage()
+export function binDir(platform = process.platform, arch = process.arch, libc = hostLibc()) {
+  const name = platformPackage(platform, arch, libc)
   if (!Object.hasOwn(self.optionalDependencies ?? {}, name))
     throw new Error(
-      `wmd: no build for ${process.platform} ${process.arch}; there is one for ` +
-        Object.keys(self.optionalDependencies ?? {}).map((n) => n.replace('@threadedstack/wmd-', '')).join(', '),
+      `wmd: no build for ${platform} ${arch}${platform === 'linux' && libc ? ` (${libc})` : ''}; there is one for ` +
+        Object.keys(self.optionalDependencies ?? {}).sort().map((n) => n.replace('@threadedstack/wmd-', '')).join(', '),
     )
   let pkg
   try {
@@ -54,8 +82,8 @@ export function binPath(name = 'wmd') {
   return p
 }
 
-/** The guest files folder (vm.wasm, Image, Image-4k, initramfs.cpio.gz, features, config) for arch. */
-export function guestDir(arch = 'arm64') {
+/** The guest files folder for arch: arm64 has vm.wasm, Image, Image-4k, initramfs.cpio.gz, features, config; amd64 has vm.wasm, bzImage, initramfs.cpio.gz, features, config. */
+export function guestDir(arch = hostGuestArch()) {
   const d = join(binDir(), 'guest', arch)
   if (!existsSync(d)) throw new Error(`wmd: this build has no ${arch} guest (${d})`)
   return d

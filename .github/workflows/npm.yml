@@ -3,9 +3,10 @@
 #
 # A published release starts it; `gh workflow run npm.yml -R threadedstack/wmd-releases -f tag=vX.Y.Z` runs it again
 # for one tag. It downloads the release's files, checks them against SHA256SUMS.txt, packs
-# @threadedstack/wmd-darwin-arm64, @threadedstack/wmd-web and @threadedstack/wmd with npm/pack.mjs,
-# installs them on a Mac with Apple silicon and runs `wmd --version` from them, and publishes each version not on npm
-# yet. npm trusts this workflow (trusted publishing): no npm token is stored anywhere.
+# the platform packages (@threadedstack/wmd-darwin-arm64, -linux-arm64, -linux-x64, -linux-arm64-musl, -linux-x64-musl),
+# @threadedstack/wmd-web and @threadedstack/wmd with npm/pack.mjs, installs them on a Mac with Apple silicon and runs
+# `wmd --version` from them, and publishes each version not on npm yet, the platform packages first. (Linux is proved
+# by scripts/linux-proof.sh before a release, not here.) npm trusts this workflow (trusted publishing): no npm token is stored anywhere.
 name: npm
 
 on:
@@ -55,8 +56,19 @@ jobs:
         run: node npm/pack.mjs --assets "$RUNNER_TEMP/assets" --tag "$TAG" --commit "$COMMIT" --out "$RUNNER_TEMP/npm"
       - name: install and run them
         run: |
+          export RUNTIME_DIR=$RUNNER_TEMP/npm
           d=$RUNNER_TEMP/try && mkdir -p "$d" && cd "$d" && npm init -y >/dev/null
-          npm install --no-audit --no-fund "$RUNNER_TEMP"/npm/*.tgz
+          # the launcher's five platform packages are overrides to the local tarballs (the registry does not have them
+          # yet), so npm picks by os, cpu and libc as it will for users: only the Mac's package is installed
+          node -e "
+            const fs = require('fs'), d = process.env.RUNTIME_DIR, o = {}
+            const pk = JSON.parse(fs.readFileSync(d + '/packages.json', 'utf8'))
+            for (const p of pk) o[p.name] = 'file:' + d + '/' + p.file
+            const l = o['@threadedstack/wmd'], w = o['@threadedstack/wmd-web']
+            delete o['@threadedstack/wmd']; delete o['@threadedstack/wmd-web']
+            fs.writeFileSync('package.json', JSON.stringify({ name: 'try', private: true, dependencies: { '@threadedstack/wmd': l, '@threadedstack/wmd-web': w }, overrides: o }))"
+          npm install --no-audit --no-fund
+          [ "$(ls node_modules/@threadedstack | tr '\n' ' ')" = "wmd wmd-darwin-arm64 wmd-web " ] || { ls node_modules/@threadedstack; exit 1; }
           out=$(npx wmd --version) && echo "$out"
           [[ "$out" == *"build ${COMMIT:0:8}"* ]] || { echo "wmd --version does not name ${COMMIT:0:8}"; exit 1; }
           node --input-type=module -e "
@@ -64,6 +76,7 @@ jobs:
             const { existsSync } = await import('node:fs')
             for (const p of m.PROGRAMS) if (!existsSync(m.binPath(p))) throw new Error(p)
             for (const g of ['vm.wasm', 'Image', 'Image-4k', 'initramfs.cpio.gz']) if (!existsSync(m.guestDir() + '/' + g)) throw new Error(g)
+            if (m.hostGuestArch() !== 'arm64') throw new Error('guest arch ' + m.hostGuestArch())
             for (const f of ['@threadedstack/wmd-web', '@threadedstack/wmd-web/wmdpack.wasm', '@threadedstack/wmd-web/relay/relay.ts', '@threadedstack/wmd-web/guest/arm64/vm.wasm'])
               if (!existsSync(new URL(import.meta.resolve(f)))) throw new Error(f)
             console.log('all programs, guest files and web files are there')"
