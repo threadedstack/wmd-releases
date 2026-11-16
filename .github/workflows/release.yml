@@ -1,0 +1,929 @@
+# The automatic release of wmd (docs/superpowers/specs/2026-11-15-auto-release-design.md). Installed as
+# .github/workflows/release.yml of threadedstack/wmd-releases by wmd's scripts/release.sh --upload (source:
+# release/release.yml of threadedstack/wmd).
+#
+# A push to wmd's main starts it through wmd's release-trigger.yml (repository_dispatch wmd-push, payload {"sha"}), and
+# that run publishes. `gh workflow run release.yml -R threadedstack/wmd-releases -f sha=<full sha>` runs every build and
+# check and publishes only with `-f publish=true`.
+#
+# plan first compares this file as installed in wmd-releases with release/release.yml of the commit. When the two
+# differ on a publishing run, plan installs the commit's file, sends the same event again and ends the run: no build
+# runs, and the run that event starts uses the commit's workflow with the commit's scripts. A dry run prints the
+# difference and goes on. Before that, plan ends the run when the commit is already released (release-plan.sh prints
+# released=vX.Y.Z), so an old commit never installs its older release.yml.
+#
+# plan decides the version and what to rebuild (scripts/release-plan.sh); the build jobs take an unchanged part from the
+# last release, checked against its SHA256SUMS.txt (scripts/release-reuse.sh), or build it (scripts/release-part.sh);
+# assemble packs the web package and the release (scripts/release.sh --prebuilt) and runs the release checks; proof
+# runs the Linux proof on arm64 and x64; publish tags wmd and publishes exactly the checked files; relay deploys the
+# relay when its code changed; on-failure opens an issue on threadedstack/wmd (not for a dry run), and deletes the run's
+# artifacts except the release artifact of a publish that failed or was cancelled after it started (SETUP.md uses it
+# to finish a partial publish; it expires after its 1 day).
+#
+# One publishing run at a time (the concurrency group release); a newer push waits as a pending run, and every job
+# before publish first gives way to it (scripts/release-give-way.sh). Nothing else cancels a run, so publish, relay and
+# on-failure finish. A dry run (by hand, publish false) has a concurrency group of its own and makes no run give way.
+# Third-party actions are pinned by commit (the tag in the comment); checkout and setup-node follow npm.yml.
+#
+# Secrets: RELEASE_APP_CLIENT_ID and RELEASE_APP_KEY (the release GitHub App), RELAY_SSH_KEY (the relay's deploy key).
+# Variables: RELAY_HOST (the relay machine) and RELAY_HOST_KEY (its known_hosts line, as ssh-keyscan prints it).
+# Job timeouts are GitHub's default: there is no measured build time to set one from.
+name: release
+# release-give-way.sh reads "(publish)" at the end of the run name
+run-name: release ${{ github.event.client_payload.sha || inputs.sha }} (${{ (github.event_name == 'repository_dispatch' || inputs.publish) && 'publish' || 'dry run' }})
+
+on:
+  repository_dispatch:
+    types: [wmd-push]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: full commit sha of threadedstack/wmd
+        required: true
+        type: string
+      publish:
+        description: publish the release (tag, GitHub release, Homebrew, relay)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: ${{ (github.event_name == 'repository_dispatch' || inputs.publish) && 'release' || format('release-dry-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+env:
+  SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+  RELEASE_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      publish: ${{ steps.commit.outputs.publish }}
+      last_tag: ${{ steps.last.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      build_vm: ${{ steps.plan.outputs.build_vm }}
+      build_guest_arm64: ${{ steps.plan.outputs.build_guest_arm64 }}
+      build_guest_amd64: ${{ steps.plan.outputs.build_guest_amd64 }}
+      build_builder: ${{ steps.plan.outputs.build_builder }}
+      relay_changed: ${{ steps.plan.outputs.relay_changed }}
+      # 1 when the run builds: the workflow is the commit's and the commit is not released yet
+      go: ${{ steps.plan.outputs.go }}
+    steps:
+      - name: the commit
+        id: commit
+        env:
+          PUBLISH: ${{ github.event_name == 'repository_dispatch' || inputs.publish }}
+        run: |
+          [[ $SHA =~ ^[0-9a-f]{40}$ ]] || { echo "the commit is not a full sha"; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          if [ "$PUBLISH" = true ]; then echo publish=1; else echo publish=0; fi >> "$GITHUB_OUTPUT"
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ steps.commit.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - name: the last release
+        id: last
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tags=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq '.[] | select(.draft | not) | .tag_name')
+          printf '%s\n' "$tags" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' > "$RUNNER_TEMP/released-tags.txt" || true
+          tag=$(sort -V "$RUNNER_TEMP/released-tags.txt" | tail -1)
+          commit=""
+          if [ -n "$tag" ]; then
+            commit=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json body --jq .body | sed -n 's/^commit: \([0-9a-f]\{40\}\)$/\1/p' | head -1)
+            gh release download "$tag" -R "$GITHUB_REPOSITORY" -p SHA256SUMS.txt -D "$RUNNER_TEMP/last" ||
+              echo "$tag has no SHA256SUMS.txt; every part is built"
+          fi
+          echo "last release: ${tag:-none} (commit ${commit:-unknown})"
+          { echo "tag=$tag"; echo "commit=$commit"; } >> "$GITHUB_OUTPUT"
+      # an already released commit ends the run here, before its older release.yml could be installed
+      - name: is the commit released
+        id: released
+        run: |
+          # only released= matters here; any other refusal is reported by the plan step
+          out=$(bash wmd/scripts/release-plan.sh plan --repo wmd --sha "$SHA" --released "$RUNNER_TEMP/released-tags.txt" 2>/dev/null) || out=""
+          tag=$(printf '%s\n' "$out" | sed -n 's/^released=//p')
+          [ -z "$tag" ] || echo "${SHA:0:8} is already released as $tag; nothing is built"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: the release workflow
+        id: workflow
+        if: steps.released.outputs.tag == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ steps.commit.outputs.publish }}
+        run: |
+          # this run's workflow file against the commit's: the scripts come from the commit, so the two must match
+          if ! git -C wmd cat-file -e "$SHA:release/release.yml" 2>/dev/null; then
+            echo "${SHA:0:8} has no release/release.yml; the installed workflow runs"
+            echo current=1 >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git -C wmd show "$SHA:release/release.yml" > "$RUNNER_TEMP/commit-release.yml"
+          gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/release.yml?ref=$GITHUB_WORKFLOW_SHA" \
+            -H 'Accept: application/vnd.github.raw' > "$RUNNER_TEMP/running-release.yml"
+          if cmp -s "$RUNNER_TEMP/running-release.yml" "$RUNNER_TEMP/commit-release.yml"; then
+            echo "this run's workflow is release/release.yml of ${SHA:0:8}"
+            echo current=1 >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "this run's workflow (${GITHUB_WORKFLOW_SHA:0:8} of $GITHUB_REPOSITORY) differs from release/release.yml of ${SHA:0:8}:"
+          diff -u "$RUNNER_TEMP/running-release.yml" "$RUNNER_TEMP/commit-release.yml" || true
+          if [ "$PUBLISH" = 1 ]; then
+            echo "installing the commit's workflow and sending this event again; this run builds nothing"
+            echo current=0 >> "$GITHUB_OUTPUT"
+          else
+            echo "a dry run goes on with this run's workflow"
+            echo current=1 >> "$GITHUB_OUTPUT"
+          fi
+      - id: releases-token
+        if: steps.workflow.outputs.current == '0'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd-releases
+          permission-contents: write
+          permission-workflows: write
+      - name: install the commit's release workflow
+        if: steps.workflow.outputs.current == '0'
+        env:
+          GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+        run: |
+          path=.github/workflows/release.yml
+          want=$RUNNER_TEMP/commit-release.yml
+          blob=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=main" --jq .sha)
+          if [ "$(git hash-object "$want")" = "$blob" ]; then
+            echo "main of $GITHUB_REPOSITORY already has it"
+          else
+            jq -n --arg m "release workflow of wmd ${SHA:0:8}" --arg c "$(base64 -w0 "$want")" --arg b "$blob" \
+              '{message: $m, content: $c, sha: $b, branch: "main"}' |
+              gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/$path" --input - --jq '"installed as \(.commit.sha)"'
+          fi
+          # the run the event starts must see the same file, or it would install and send again
+          gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=main" -H 'Accept: application/vnd.github.raw' > "$RUNNER_TEMP/installed.yml"
+          cmp -s "$want" "$RUNNER_TEMP/installed.yml" ||
+            { echo "main of $GITHUB_REPOSITORY does not hold release/release.yml of ${SHA:0:8}; nothing was sent"; exit 1; }
+      # a newer push installs the same way: this run never sends its event over a newer pending one
+      - name: give way to a newer run
+        if: steps.workflow.outputs.current == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - name: send the event again
+        if: steps.workflow.outputs.current == '0'
+        env:
+          GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+          RUN_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ]; then
+            # the same event type and payload
+            jq -c '{event_type: .action, client_payload: .client_payload}' "$GITHUB_EVENT_PATH" |
+              gh api "repos/$GITHUB_REPOSITORY/dispatches" --input -
+          else
+            # a run by hand with publish: the same inputs (workflow_dispatch needs actions write, which the run's token has)
+            GH_TOKEN=$RUN_TOKEN gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref main -f sha="$SHA" -f publish=true
+          fi
+          echo "sent again: the next run builds ${SHA:0:8} with release/release.yml of ${SHA:0:8}"
+      - name: the relay's commit
+        id: relay
+        if: steps.workflow.outputs.current == '1'
+        env:
+          RELAY_HOST: ${{ vars.RELAY_HOST }}
+          RELAY_HOST_KEY: ${{ vars.RELAY_HOST_KEY }}
+          RELAY_SSH_KEY: ${{ secrets.RELAY_SSH_KEY }}
+        run: |
+          commit=""
+          if [ -n "$RELAY_HOST" ] && [ -n "$RELAY_HOST_KEY" ] && [ -n "$RELAY_SSH_KEY" ]; then
+            key=$RUNNER_TEMP/relay-key known=$RUNNER_TEMP/relay-known-hosts
+            trap 'rm -f "$key" "$known"' EXIT
+            (umask 077 && printf '%s\n' "$RELAY_SSH_KEY" > "$key")
+            printf '%s\n' "$RELAY_HOST_KEY" > "$known"
+            out=$(ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$known" "wmd-deploy@$RELAY_HOST" status) || out=""
+            commit=$(printf '%s\n' "$out" | sed -n 's/^relay \([0-9a-f]\{7,40\}\)$/\1/p' | head -1)
+          fi
+          # unknown means changed: the relay is deployed after publishing
+          echo "the relay runs ${commit:-an unknown commit}"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: steps.workflow.outputs.current == '1'
+      - name: plan
+        id: plan
+        if: steps.workflow.outputs.current == '1'
+        env:
+          LAST_TAG: ${{ steps.last.outputs.tag }}
+          LAST_COMMIT: ${{ steps.last.outputs.commit }}
+          RELAY_COMMIT: ${{ steps.relay.outputs.commit }}
+        run: |
+          args=(plan --repo wmd --sha "$SHA" --released "$RUNNER_TEMP/released-tags.txt")
+          [ -z "$LAST_TAG" ] || args+=(--last-tag "$LAST_TAG" --last-commit "$LAST_COMMIT")
+          [ ! -f "$RUNNER_TEMP/last/SHA256SUMS.txt" ] || args+=(--last-sums "$RUNNER_TEMP/last/SHA256SUMS.txt")
+          [ -z "$RELAY_COMMIT" ] || args+=(--relay-commit "$RELAY_COMMIT")
+          out=$(bash wmd/scripts/release-plan.sh "${args[@]}")
+          echo "$out"
+          echo "$out" >> "$GITHUB_OUTPUT"
+          if printf '%s\n' "$out" | grep -q '^released='; then
+            echo "${SHA:0:8} is already released as $(printf '%s\n' "$out" | sed -n 's/^released=//p'); nothing is built"
+            echo go=0 >> "$GITHUB_OUTPUT"
+          else
+            echo go=1 >> "$GITHUB_OUTPUT"
+          fi
+
+  vm:
+    needs: plan
+    if: needs.plan.outputs.go == '1'
+    runs-on: ubuntu-24.04-arm
+    env:
+      LAST_TAG: ${{ needs.plan.outputs.last_tag }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - name: take vm.wasm from the last release
+        id: reuse
+        if: needs.plan.outputs.build_vm == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if bash wmd/scripts/release-reuse.sh --tag "$LAST_TAG" --out "$RUNNER_TEMP/out" files vm.wasm; then
+            echo build=0; else echo build=1; fi >> "$GITHUB_OUTPUT"
+      - name: build vm.wasm
+        if: needs.plan.outputs.build_vm == '1' || steps.reuse.outputs.build == '1'
+        run: bash wmd/scripts/release-part.sh vm --src wmd --out "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vm
+          path: ${{ runner.temp }}/out/vm.wasm
+          if-no-files-found: error
+          retention-days: 1
+
+  guest-arm64:
+    needs: [plan, vm]
+    runs-on: ubuntu-24.04-arm
+    env:
+      LAST_TAG: ${{ needs.plan.outputs.last_tag }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - name: take the arm64 guest from the last release
+        id: reuse
+        if: needs.plan.outputs.build_guest_arm64 == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if bash wmd/scripts/release-reuse.sh --tag "$LAST_TAG" --out "$RUNNER_TEMP/out" files Image Image-4k initramfs.cpio.gz features config; then
+            echo build=0; else echo build=1; fi >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.plan.outputs.build_guest_arm64 == '1' || steps.reuse.outputs.build == '1'
+        with:
+          name: vm
+          path: ${{ runner.temp }}/vm
+      - name: build the arm64 guest
+        if: needs.plan.outputs.build_guest_arm64 == '1' || steps.reuse.outputs.build == '1'
+        run: |
+          bash wmd/scripts/release-part.sh guest-arm64 --src wmd --vm "$RUNNER_TEMP/vm/vm.wasm" --out "$RUNNER_TEMP/part"
+          mkdir -p "$RUNNER_TEMP/out"
+          for f in Image Image-4k initramfs.cpio.gz features config; do mv "$RUNNER_TEMP/part/$f" "$RUNNER_TEMP/out/$f"; done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: guest-arm64
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 1
+
+  guest-amd64:
+    needs: plan
+    if: needs.plan.outputs.go == '1'
+    runs-on: ubuntu-24.04
+    env:
+      LAST_TAG: ${{ needs.plan.outputs.last_tag }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - name: take the amd64 guest from the last release's x64 bundle
+        id: reuse
+        if: needs.plan.outputs.build_guest_amd64 == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if bash wmd/scripts/release-reuse.sh --tag "$LAST_TAG" --out "$RUNNER_TEMP/out" \
+            unpack wmd-linux-x64.tar.gz bin/guest/amd64 bzImage initramfs.cpio.gz features config; then
+            echo build=0; else echo build=1; fi >> "$GITHUB_OUTPUT"
+      - name: build the amd64 guest
+        if: needs.plan.outputs.build_guest_amd64 == '1' || steps.reuse.outputs.build == '1'
+        run: bash wmd/scripts/release-part.sh guest-amd64 --src wmd --out "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: guest-amd64
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 1
+
+  mac:
+    needs: plan
+    if: needs.plan.outputs.go == '1'
+    runs-on: macos-15
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: wmd/go.mod
+          cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: build the macOS programs and wmdpack.wasm
+        run: bash wmd/scripts/release-part.sh mac --src wmd --out "$RUNNER_TEMP/out"
+      - name: Go unit tests (macOS)
+        run: make -C wmd test-unit
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mac
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-arm64:
+    needs: [plan, vm, guest-arm64]
+    runs-on: ubuntu-24.04-arm
+    env:
+      LAST_TAG: ${{ needs.plan.outputs.last_tag }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: wmd/go.mod
+          cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vm
+          path: ${{ runner.temp }}/vm
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: guest-arm64
+          path: ${{ runner.temp }}/guest
+      - name: build wmd-linux-arm64.tar.gz and wmd-linux-arm64-musl.tar.gz
+        run: |
+          bash wmd/scripts/release-part.sh linux --arch arm64 --src wmd --guest "$RUNNER_TEMP/guest" --vm "$RUNNER_TEMP/vm/vm.wasm" \
+            --out "$RUNNER_TEMP/linux"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-arm64
+          path: ${{ runner.temp }}/linux/
+          if-no-files-found: error
+          retention-days: 1
+      - name: take the arm64 builder image from the last release
+        id: reuse
+        if: needs.plan.outputs.build_builder == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if bash wmd/scripts/release-reuse.sh --tag "$LAST_TAG" --out "$RUNNER_TEMP/builder" builder arm64; then
+            echo build=0; else echo build=1; fi >> "$GITHUB_OUTPUT"
+      - name: build the arm64 builder image with this release's wmd
+        if: needs.plan.outputs.build_builder == '1' || steps.reuse.outputs.build == '1'
+        run: |
+          bash wmd/scripts/release-part.sh builder --arch arm64 --src wmd --bundle "$RUNNER_TEMP/linux/wmd-linux-arm64.tar.gz" \
+            --out "$RUNNER_TEMP/builder"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: builder-arm64
+          path: ${{ runner.temp }}/builder/builder-arm64.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-x64:
+    needs: [plan, vm, guest-amd64]
+    runs-on: ubuntu-24.04
+    env:
+      LAST_TAG: ${{ needs.plan.outputs.last_tag }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: wmd/go.mod
+          cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vm
+          path: ${{ runner.temp }}/vm
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: guest-amd64
+          path: ${{ runner.temp }}/guest
+      - name: build wmd-linux-x64.tar.gz and wmd-linux-x64-musl.tar.gz
+        run: |
+          bash wmd/scripts/release-part.sh linux --arch x64 --src wmd --guest "$RUNNER_TEMP/guest" --vm "$RUNNER_TEMP/vm/vm.wasm" \
+            --out "$RUNNER_TEMP/linux"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-x64
+          path: ${{ runner.temp }}/linux/
+          if-no-files-found: error
+          retention-days: 1
+      - name: take the amd64 builder image from the last release
+        id: reuse
+        if: needs.plan.outputs.build_builder == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if bash wmd/scripts/release-reuse.sh --tag "$LAST_TAG" --out "$RUNNER_TEMP/builder" builder amd64; then
+            echo build=0; else echo build=1; fi >> "$GITHUB_OUTPUT"
+      - name: build the amd64 builder image with this release's wmd
+        if: needs.plan.outputs.build_builder == '1' || steps.reuse.outputs.build == '1'
+        run: |
+          bash wmd/scripts/release-part.sh builder --arch amd64 --src wmd --bundle "$RUNNER_TEMP/linux/wmd-linux-x64.tar.gz" \
+            --out "$RUNNER_TEMP/builder"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: builder-amd64
+          path: ${{ runner.temp }}/builder/builder-amd64.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble:
+    needs: [plan, mac, vm, guest-arm64, linux-arm64, linux-x64]
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          fetch-depth: 0
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: wmd/go.mod
+          cache: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # make release-test runs install.sh in linux/arm64 containers on this x64 machine
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mac
+          path: ${{ runner.temp }}/pre
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vm
+          path: ${{ runner.temp }}/pre
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: guest-arm64
+          path: ${{ runner.temp }}/pre
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-arm64
+          path: ${{ runner.temp }}/pre
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-x64
+          path: ${{ runner.temp }}/pre
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: builder-arm64
+          path: ${{ runner.temp }}/builder
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: builder-amd64
+          path: ${{ runner.temp }}/builder
+      - name: pack the web package with both builder images
+        run: |
+          bash wmd/scripts/release-part.sh web --src wmd --vm "$RUNNER_TEMP/pre/vm.wasm" --guest "$RUNNER_TEMP/pre" \
+            --builder "$RUNNER_TEMP/builder" --out "$RUNNER_TEMP/web"
+          cp "$RUNNER_TEMP"/web/wmd-web-*.tgz "$RUNNER_TEMP"/web/wmd-web-*-builder-*.tar "$RUNNER_TEMP/pre/"
+      - name: assemble the release
+        run: |
+          git config --global user.name "wmd release"
+          git config --global user.email release@wmd.invalid
+          # the full clone has wmd's tags: the plan let through only a tag that names this commit
+          git -C wmd rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git -C wmd tag -a "$TAG" -m "wmd $VERSION"
+          bash wmd/scripts/release.sh --repo wmd --prebuilt "$RUNNER_TEMP/pre" --out "$RUNNER_TEMP/release"
+      - name: release checks (make release-test)
+        run: make -C wmd release-test
+      - name: Go unit tests (Linux)
+        run: make -C wmd test-unit
+      - name: npm tests
+        run: make -C wmd test-npm
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+          retention-days: 1
+
+  proof:
+    needs: [plan, assemble]
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+      - name: Linux proof (${{ matrix.arch }})
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: make -C wmd test-linux-host NPM="$RUNNER_TEMP/release/npm" REL="$RUNNER_TEMP/release/assets" ARGS="--arch $ARCH"
+
+  publish:
+    needs: [plan, assemble, proof]
+    if: needs.plan.outputs.go == '1' && needs.plan.outputs.publish == '1'
+    runs-on: ubuntu-24.04
+    env:
+      SHA: ${{ needs.plan.outputs.sha }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - id: wmd-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: write
+      - id: releases-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd-releases
+          permission-contents: write
+          permission-workflows: write
+      - id: tap-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: homebrew-wmd
+          permission-contents: write
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.wmd-token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/checked
+      - name: git sign-in, one App token per repository
+        run: |
+          git config --global user.name "wmd release"
+          git config --global user.email release@wmd.invalid
+          # each helper reads its repository's token from the environment when git asks: no token in a file or a URL
+          git config --global credential.useHttpPath true
+          for r in wmd:WMD_TOKEN wmd-releases:RELEASES_TOKEN homebrew-wmd:TAP_TOKEN; do
+            for u in "https://github.com/threadedstack/${r%%:*}" "https://github.com/threadedstack/${r%%:*}.git"; do
+              git config --global "credential.$u.helper" \
+                "!f() { test \"\$1\" = get && echo username=x-access-token && echo \"password=\$${r#*:}\"; }; f"
+            done
+          done
+      - name: tag ${{ needs.plan.outputs.tag }} in this checkout
+        id: tag
+        env:
+          WMD_TOKEN: ${{ steps.wmd-token.outputs.token }}
+        run: |
+          git -C wmd tag -a "$TAG" -m "wmd $VERSION"
+          refs=$(git -C wmd ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          have=$(printf '%s\n' "$refs" | awk '$2 ~ /\^\{\}$/ { print $1 }')
+          [ -n "$have" ] || have=$(printf '%s\n' "$refs" | awk 'NF { print $1 }')
+          if [ -z "$have" ]; then
+            echo push=1 >> "$GITHUB_OUTPUT"
+          elif [ "$have" = "$SHA" ]; then
+            echo "wmd already has $TAG at this commit"
+            echo push=0 >> "$GITHUB_OUTPUT"
+          else
+            echo "wmd has $TAG at ${have:0:8}, not ${SHA:0:8}; nothing was published"
+            exit 1
+          fi
+      # every check of release.sh --upload (the checked sums, no release of this tag yet) before the tag leaves this
+      # machine: a refusal here never costs a version number
+      - name: check ${{ needs.plan.outputs.tag }} before the tag is pushed
+        env:
+          GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+        run: |
+          bash wmd/scripts/release.sh --repo wmd --prebuilt "$RUNNER_TEMP/checked/assets" --out "$RUNNER_TEMP/check" \
+            --expect-sums "$RUNNER_TEMP/checked/assets/SHA256SUMS.txt" --check
+      - name: push the tag ${{ needs.plan.outputs.tag }} to wmd
+        if: steps.tag.outputs.push == '1'
+        env:
+          WMD_TOKEN: ${{ steps.wmd-token.outputs.token }}
+        run: git -C wmd push origin "refs/tags/$TAG"
+      - name: publish ${{ needs.plan.outputs.tag }} with the checked files
+        env:
+          GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+          RELEASES_TOKEN: ${{ steps.releases-token.outputs.token }}
+          TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
+        run: |
+          bash wmd/scripts/release.sh --repo wmd --prebuilt "$RUNNER_TEMP/checked/assets" --out "$RUNNER_TEMP/publish" \
+            --expect-sums "$RUNNER_TEMP/checked/assets/SHA256SUMS.txt" --upload
+      - name: delete the run's artifacts
+        if: needs.plan.outputs.relay_changed != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[].id' |
+            while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"; done
+
+  relay:
+    needs: [plan, publish]
+    if: needs.plan.outputs.relay_changed == '1'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: deploy the relay of ${{ needs.plan.outputs.tag }}
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          RELAY_HOST: ${{ vars.RELAY_HOST }}
+          RELAY_HOST_KEY: ${{ vars.RELAY_HOST_KEY }}
+          RELAY_SSH_KEY: ${{ secrets.RELAY_SSH_KEY }}
+        run: |
+          [ -n "$RELAY_HOST" ] && [ -n "$RELAY_HOST_KEY" ] && [ -n "$RELAY_SSH_KEY" ] ||
+            { echo "vars.RELAY_HOST, vars.RELAY_HOST_KEY and secrets.RELAY_SSH_KEY are needed to deploy the relay"; exit 1; }
+          key=$RUNNER_TEMP/relay-key known=$RUNNER_TEMP/relay-known-hosts
+          trap 'rm -f "$key" "$known"' EXIT
+          (umask 077 && printf '%s\n' "$RELAY_SSH_KEY" > "$key")
+          printf '%s\n' "$RELAY_HOST_KEY" > "$known"
+          ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known" "wmd-deploy@$RELAY_HOST" "$TAG"
+      - name: delete the run's artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[].id' |
+            while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"; done
+
+  # a run by hand without publish: everything was built and checked; nothing is kept
+  discard:
+    needs: [plan, assemble, proof]
+    if: needs.plan.outputs.go == '1' && needs.plan.outputs.publish == '0'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: delete the run's artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[].id' |
+            while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"; done
+
+  on-failure:
+    needs: [plan, vm, guest-arm64, guest-amd64, mac, linux-arm64, linux-x64, assemble, proof, publish, relay, discard]
+    # cancelled(): a run that gave way still deletes its artifacts; only failed jobs open the issue
+    if: failure() || cancelled()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: did publish start
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # a publish job that failed or was cancelled after it started (it has steps) may have published part of the
+          # release: its release artifact is kept for release/SETUP.md's partial-publish steps, and so is it when the
+          # job list cannot be read
+          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate --jq '
+            .jobs[] | select(.name == "publish") | select(.conclusion == "failure" or .conclusion == "cancelled")
+            | select((.steps // []) | length > 0) | .name') || started=unknown
+          if [ -n "$started" ]; then echo keep=1; else echo keep=0; fi >> "$GITHUB_OUTPUT"
+      - id: token
+        # a dry run that fails only fails the run: no issue
+        if: env.RELEASE_DRY_RUN != 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-issues: write
+      - name: open or update the issue on threadedstack/wmd
+        if: env.RELEASE_DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          RUN_TOKEN: ${{ github.token }}
+          KEEP: ${{ steps.publish.outputs.keep }}
+        run: |
+          # a job stopped only by giving way to a newer run is not a failure of the release
+          # shellcheck disable=SC2016
+          failed=$(GH_TOKEN=$RUN_TOKEN gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate --jq '
+            .jobs[] | select(.conclusion == "failure")
+            | [.steps[]? | select(.conclusion == "failure") | .name] as $s
+            | select($s != ["give way to a newer run"])
+            | "- \(.name): \(if ($s | length) > 0 then ($s | join(", ")) else "no step failed" end)"')
+          if [ -z "$failed" ]; then
+            echo "no job failed except by giving way to a newer run; no issue"
+            exit 0
+          fi
+          commit=$SHA; [[ $commit =~ ^[0-9a-f]{40}$ ]] || commit="(not a commit sha)"
+          short=${commit:0:8}; [[ $short =~ ^[0-9a-f]{8}$ ]] || short=unknown
+          title="release failed: $short"
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body=$(printf 'commit: %s\nrun: %s\n\nfailed:\n%s\n' "$commit" "$run" "$failed")
+          if [ "$KEEP" = 1 ]; then
+            body=$(printf '%s\n\npublish failed after it started: the run keeps its release artifact for 1 day. See the partial publish steps in release/SETUP.md.\n' "$body")
+          fi
+          n=$(gh issue list -R threadedstack/wmd --state open --search "\"$title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ -n "$n" ]; then
+            gh issue comment "$n" -R threadedstack/wmd --body "$body"
+          else
+            gh issue create -R threadedstack/wmd --title "$title" --body "$body"
+          fi
+      - name: delete the run's artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ steps.publish.outputs.keep }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[] | "\(.id) \(.name)"' |
+            while read -r id name; do
+              if [ "$KEEP" = 1 ] && [ "$name" = release ]; then
+                echo "kept the release artifact (publish failed after it started; it expires after 1 day)"
+                continue
+              fi
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+            done
