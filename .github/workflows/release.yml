@@ -20,6 +20,12 @@
 # artifacts except the release artifact of a publish that failed or was cancelled after it started (SETUP.md uses it
 # to finish a partial publish; it expires after its 1 day).
 #
+# The tests run only where the changes since the last released commit can reach them (D-610): the Go unit tests (mac
+# and assemble) test the packages scripts/release-plan.sh go-tests prints for that machine, none when no Go package
+# changed; assemble runs make release-test, make release-plan-test and make test-npm only when release-plan.sh checks
+# says a file it reads changed. An unknown last commit runs every test. Each step's log says what runs and why. The
+# Linux proof and every build always run.
+#
 # One publishing run at a time (the concurrency group release); a newer push waits as a pending run, and every job
 # before publish first gives way to it (scripts/release-give-way.sh). Nothing else cancels a run, so publish, relay and
 # on-failure finish. A dry run (by hand, publish false) has a concurrency group of its own and makes no run give way.
@@ -69,6 +75,8 @@ jobs:
       sha: ${{ steps.commit.outputs.sha }}
       publish: ${{ steps.commit.outputs.publish }}
       last_tag: ${{ steps.last.outputs.tag }}
+      # empty when there is no last release or its notes name no commit: every test runs
+      last_commit: ${{ steps.last.outputs.commit }}
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
       build_vm: ${{ steps.plan.outputs.build_vm }}
@@ -417,6 +425,8 @@ jobs:
           ref: ${{ needs.plan.outputs.sha }}
           token: ${{ steps.token.outputs.token }}
           path: wmd
+          # the last released commit too: go-tests compares it with this one
+          fetch-depth: 0
           persist-credentials: false
       - name: give way to a newer run
         env:
@@ -429,8 +439,28 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - name: build the macOS programs and wmdpack.wasm
         run: bash wmd/scripts/release-part.sh mac --src wmd --out "$RUNNER_TEMP/out"
+      - name: which Go packages to test (macOS)
+        id: gotests
+        env:
+          LAST_COMMIT: ${{ needs.plan.outputs.last_commit }}
+        run: |
+          # make test-unit tests ./internal/...; this tests the part of it that the changes since the last release reach
+          pkgs=$(bash wmd/scripts/release-plan.sh go-tests --repo wmd --from "$LAST_COMMIT" --to "$SHA") ||
+            { echo "release-plan.sh go-tests failed; every package is tested"; pkgs=./internal/...; }
+          if [ -z "$pkgs" ]; then
+            echo "no Go tests run: no package that ./internal/... tests build changed since the last release"
+            echo go=0 >> "$GITHUB_OUTPUT"
+          else
+            printf 'Go tests of:\n%s\n' "$pkgs"
+            { echo go=1; echo "pkgs=$(printf '%s\n' "$pkgs" | tr '\n' ' ')"; } >> "$GITHUB_OUTPUT"
+          fi
       - name: Go unit tests (macOS)
-        run: make -C wmd test-unit
+        if: steps.gotests.outputs.go != '0'
+        env:
+          PKGS: ${{ steps.gotests.outputs.pkgs }}
+        run: |
+          # shellcheck disable=SC2086 # one argument per package
+          cd wmd && go test $PKGS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mac
@@ -608,8 +638,27 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+      - name: which checks run
+        id: checks
+        env:
+          LAST_COMMIT: ${{ needs.plan.outputs.last_commit }}
+        run: |
+          out=$(bash wmd/scripts/release-plan.sh checks --repo wmd --from "$LAST_COMMIT" --to "$SHA") ||
+            { echo "release-plan.sh checks failed; every check runs"; out=$(printf 'release_test=1\nrelease_plan_test=1\nnpm_test=1'); }
+          echo "$out"
+          echo "$out" >> "$GITHUB_OUTPUT"
+          pkgs=$(bash wmd/scripts/release-plan.sh go-tests --repo wmd --from "$LAST_COMMIT" --to "$SHA") ||
+            { echo "release-plan.sh go-tests failed; every package is tested"; pkgs=./internal/...; }
+          if [ -z "$pkgs" ]; then
+            echo "no Go tests run: no package that ./internal/... tests build changed since the last release"
+            echo go=0 >> "$GITHUB_OUTPUT"
+          else
+            printf 'Go tests of:\n%s\n' "$pkgs"
+            { echo go=1; echo "pkgs=$(printf '%s\n' "$pkgs" | tr '\n' ' ')"; } >> "$GITHUB_OUTPUT"
+          fi
       # make release-test runs install.sh in linux/arm64 containers on this x64 machine
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: steps.checks.outputs.release_test != '0'
         with:
           platforms: arm64
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -653,12 +702,23 @@ jobs:
           git -C wmd rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git -C wmd tag -a "$TAG" -m "wmd $VERSION"
           bash wmd/scripts/release.sh --repo wmd --prebuilt "$RUNNER_TEMP/pre" --out "$RUNNER_TEMP/release"
       - name: release checks (make release-test)
+        if: steps.checks.outputs.release_test != '0'
         run: make -C wmd release-test
+      - name: release plan checks (make release-plan-test)
+        if: steps.checks.outputs.release_plan_test != '0'
+        run: make -C wmd release-plan-test
       - name: zsh for the shell PATH tests (internal/service runs /bin/zsh; Ubuntu runners have none)
+        if: steps.checks.outputs.go != '0'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
       - name: Go unit tests (Linux)
-        run: make -C wmd test-unit
+        if: steps.checks.outputs.go != '0'
+        env:
+          PKGS: ${{ steps.checks.outputs.pkgs }}
+        run: |
+          # shellcheck disable=SC2086 # one argument per package
+          cd wmd && go test $PKGS
       - name: npm tests
+        if: steps.checks.outputs.npm_test != '0'
         run: make -C wmd test-npm
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
