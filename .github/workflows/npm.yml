@@ -83,13 +83,38 @@ jobs:
       - name: publish
         run: |
           cd "$RUNNER_TEMP/npm"
-          for f in $(node -e "for (const p of require('./packages.json')) console.log(p.name + '@' + p.version + ' ' + p.file)" | tr ' ' ':'); do
-            spec=${f%%:*}; file=${f#*:}
-            if npm view "$spec" version >/dev/null 2>&1; then echo "$spec is already on npm"; continue; fi
-            npm publish "./$file" --access public --provenance
-            # npm takes minutes to make a large package public (the platform package: about 10); @threadedstack/wmd is
-            # published only once its platform package can be installed, or an install in between would skip it
-            for i in $(seq 1 120); do npm view "$spec" version --prefer-online >/dev/null 2>&1 && break; sleep 30; done
-            npm view "$spec" version --prefer-online >/dev/null 2>&1 || { echo "$spec is still not on npm after 60 minutes"; exit 1; }
-            echo "$spec is on npm"
-          done
+          launcher=@threadedstack/wmd
+          specs=$(node -e "for (const p of require('./packages.json')) console.log(p.name + '@' + p.version + ':' + p.file)")
+          # publish SPEC:FILE... at once, then wait until npm shows each one: npm takes minutes to make a large package
+          # public (a platform package: about 10), and the packages do not wait on one another
+          publish() {
+            pids=()
+            for f in "$@"; do
+              spec=${f%%:*}; file=${f#*:}
+              if npm view "$spec" version >/dev/null 2>&1; then echo "$spec is already on npm"; continue; fi
+              npm publish "./$file" --access public --provenance & pids+=($!)
+            done
+            # every upload ends before a failed one stops the step, so the log shows each result
+            failed=0; for p in "${pids[@]}"; do wait "$p" || failed=1; done
+            [ $failed -eq 0 ] || exit 1
+            left=("$@")
+            for i in $(seq 1 120); do
+              next=()
+              for f in "${left[@]}"; do
+                spec=${f%%:*}
+                if npm view "$spec" version --prefer-online >/dev/null 2>&1; then echo "$spec is on npm"; else next+=("$f"); fi
+              done
+              left=("${next[@]}")
+              [ ${#left[@]} -eq 0 ] && return 0
+              sleep 30
+            done
+            for f in "${left[@]}"; do echo "${f%%:*} is still not on npm after 60 minutes"; done
+            exit 1
+          }
+          # every package but the launcher first, all at once; the launcher only once its platform packages can be
+          # installed, or an install in between would skip them
+          others=(); main=()
+          for f in $specs; do spec=${f%%:*}; if [ "${spec%@*}" = "$launcher" ]; then main+=("$f"); else others+=("$f"); fi; done
+          [ ${#main[@]} -eq 1 ] || { echo "packages.json has ${#main[@]} $launcher packages, not 1"; exit 1; }
+          publish "${others[@]}"
+          publish "${main[@]}"
