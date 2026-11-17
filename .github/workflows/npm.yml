@@ -85,6 +85,19 @@ jobs:
           cd "$RUNNER_TEMP/npm"
           launcher=@threadedstack/wmd
           specs=$(node -e "for (const p of require('./packages.json')) console.log(p.name + '@' + p.version + ':' + p.file)")
+          # upload SPEC FILE, and upload it again every 30 seconds for up to 60 minutes while it fails: a network blip
+          # (v0.1.23's first run: every upload failed to reach fulcio.sigstore.dev, which signs the provenance, and the
+          # rerun minutes later passed) must not leave a release off npm. A failed upload that reached npm anyway is
+          # not uploaded again.
+          upload() {
+            spec=$1; file=$2; start=$SECONDS
+            until npm publish "./$file" --access public --provenance; do
+              if npm view "$spec" version --prefer-online >/dev/null 2>&1; then echo "$spec reached npm"; return 0; fi
+              if [ $((SECONDS - start)) -ge 3600 ]; then echo "$spec: every upload failed for 60 minutes"; return 1; fi
+              echo "$spec: the upload failed; trying again in 30 seconds"
+              sleep 30
+            done
+          }
           # publish SPEC:FILE... at once, then wait until npm shows each one: npm takes minutes to make a large package
           # public (a platform package: about 10), and the packages do not wait on one another
           publish() {
@@ -92,7 +105,7 @@ jobs:
             for f in "$@"; do
               spec=${f%%:*}; file=${f#*:}
               if npm view "$spec" version >/dev/null 2>&1; then echo "$spec is already on npm"; continue; fi
-              npm publish "./$file" --access public --provenance & pids+=($!)
+              upload "$spec" "$file" & pids+=($!)
             done
             # every upload ends before a failed one stops the step, so the log shows each result
             failed=0; for p in "${pids[@]}"; do wait "$p" || failed=1; done
@@ -118,3 +131,43 @@ jobs:
           [ ${#main[@]} -eq 1 ] || { echo "packages.json has ${#main[@]} $launcher packages, not 1"; exit 1; }
           publish "${others[@]}"
           publish "${main[@]}"
+
+  on-failure:
+    needs: [publish]
+    if: failure()
+    runs-on: ubuntu-24.04
+    # reads this run's job list to name what failed; the issue is written with the App's token
+    permissions:
+      actions: read
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-issues: write
+      - name: open or update the issue on threadedstack/wmd
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          RUN_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          # the same issue the release workflow opens for a failed release, so a failed npm publish is not missed
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || TAG="(not a version tag)"
+          # shellcheck disable=SC2016
+          failed=$(GH_TOKEN=$RUN_TOKEN gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate --jq '
+            .jobs[] | select(.conclusion == "failure")
+            | [.steps[]? | select(.conclusion == "failure") | .name] as $s
+            | "- \(.name): \(if ($s | length) > 0 then ($s | join(", ")) else "no step failed" end)"')
+          title="npm publish failed: $TAG"
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body=$(printf 'release: %s\nrun: %s\n\nfailed:\n%s\n\nRe-run failed jobs on the run publishes what is not on npm yet.\n' "$TAG" "$run" "$failed")
+          n=$(gh issue list -R threadedstack/wmd --state open --search "\"$title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ -n "$n" ]; then
+            gh issue comment "$n" -R threadedstack/wmd --body "$body"
+          else
+            gh issue create -R threadedstack/wmd --title "$title" --body "$body"
+          fi
