@@ -654,6 +654,8 @@ jobs:
           bash wmd/scripts/release.sh --repo wmd --prebuilt "$RUNNER_TEMP/pre" --out "$RUNNER_TEMP/release"
       - name: release checks (make release-test)
         run: make -C wmd release-test
+      - name: zsh for the shell PATH tests (internal/service runs /bin/zsh; Ubuntu runners have none)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
       - name: Go unit tests (Linux)
         run: make -C wmd test-unit
       - name: npm tests
