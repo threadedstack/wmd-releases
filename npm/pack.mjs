@@ -5,12 +5,16 @@
 //   node npm/pack.mjs --assets DIR --tag vX.Y.Z --commit SHA --out DIR
 //
 //   @threadedstack/wmd-darwin-arm64   bin/ wmd wmdd wmd-run wmd-relay wmd-exe-stub wmd-fixtures-gen bootlock.sh
-//                                     bin/guest/arm64/ vm.wasm Image Image-4k initramfs.cpio.gz features config
+//                                     bin/guest/arm64/ vm.wasm Image Image-4k initramfs.cpio.gz features config and the
+//                                     compiler cache of `wmd build` (X11): wmd-ccwrap-linux-arm64 wmd-ccshim-linux-arm64
+//                                     ccache-linux-arm64 ccache-LICENSE.txt ccache-SOURCE.txt ccache-source.tar.xz
 //                                     (os darwin, cpu arm64: npm installs it only on a Mac with Apple silicon)
 //   @threadedstack/wmd-linux-arm64, -linux-x64, -linux-arm64-musl, -linux-x64-musl
 //                                     the same programs from the release's wmd-linux-<arch>[-musl].tar.gz (bin/);
 //                                     guest/amd64/ (vm.wasm bzImage initramfs.cpio.gz features config) on x64,
-//                                     guest/arm64/ on arm64 (os linux, cpu, libc glibc or musl: npm installs one)
+//                                     guest/arm64/ on arm64 (os linux, cpu, libc glibc or musl: npm installs one); each with its
+//                                     chip's compiler cache files. They hold a stock ccache (GPL-3.0-or-later), so a platform
+//                                     package's license is "MIT AND GPL-3.0-or-later"; @threadedstack/wmd and -web stay MIT.
 //   @threadedstack/wmd                the wmd, wmdd and wmd-relay commands and a small API (npm/wmd), which find the
 //                                     programs in the platform package, its optional dependency of the same version
 //   @threadedstack/wmd-web            the browser host: the wmd-web tgz's files (src/, export-page/, guest/arm64/,
@@ -30,8 +34,11 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const SCOPE = '@threadedstack'
 const REPO = 'https://github.com/threadedstack/wmd-releases'
 const PROGRAMS = ['wmd', 'wmdd', 'wmd-run', 'wmd-relay', 'wmd-exe-stub', 'wmd-fixtures-gen', 'bootlock.sh']
-const GUEST_ARM64 = ['vm.wasm', 'Image', 'Image-4k', 'initramfs.cpio.gz', 'features', 'config']
-const GUEST_AMD64 = ['vm.wasm', 'bzImage', 'initramfs.cpio.gz', 'features', 'config']
+// the compiler cache's programs and license files of one guest chip (scripts/release.sh CC_FILES)
+const ccFiles = (garch) => [`wmd-ccwrap-linux-${garch}`, `wmd-ccshim-linux-${garch}`, `ccache-linux-${garch}`,
+  'ccache-LICENSE.txt', 'ccache-SOURCE.txt', 'ccache-source.tar.xz']
+const GUEST_ARM64 = ['vm.wasm', 'Image', 'Image-4k', 'initramfs.cpio.gz', 'features', 'config', ...ccFiles('arm64')]
+const GUEST_AMD64 = ['vm.wasm', 'bzImage', 'initramfs.cpio.gz', 'features', 'config', ...ccFiles('amd64')]
 // the platform packages, in publish order. from: 'assets' takes the bare release files; a file name takes bin/ out of
 // that tarball (garch: the guest folder under bin/guest). libc: what npm's "libc" field checks on Linux.
 const PLATFORMS = [
@@ -132,6 +139,7 @@ for (const p of PLATFORMS) {
   writeJson(join(dir, 'package.json'), {
     name: pkgName,
     ...common,
+    license: 'MIT AND GPL-3.0-or-later',
     description: `wmd ${version} for ${p.label}: the programs and the ${p.garch} guest (used by ${SCOPE}/wmd)`,
     wmd: meta,
     os: [p.os],
@@ -145,7 +153,8 @@ for (const p of PLATFORMS) {
 The ${p.label} build of wmd ${version} (commit \`${commit}\`): \`bin/\` holds ${PROGRAMS.slice(0, -1).join(', ')} and
 ${PROGRAMS.at(-1)}, and \`bin/guest/${p.garch}/\` the guest. Install
 [${SCOPE}/wmd](https://www.npmjs.com/package/${SCOPE}/wmd) instead: it picks this package on ${p.where}.
-The files are the ones of [release ${tag}](${REPO}/releases/tag/${tag}), byte for byte.${p.os === 'darwin' ? ' They are not signed with a\nDeveloper ID and not notarized.' : ''}
+The files are the ones of [release ${tag}](${REPO}/releases/tag/${tag}), byte for byte. wmd is MIT licensed; \`bin/guest/${p.garch}/ccache-linux-${p.garch}\`
+is a stock ccache (GPL-3.0-or-later) that \`wmd build\` runs: its license and source are \`ccache-LICENSE.txt\`, \`ccache-SOURCE.txt\` and \`ccache-source.tar.xz\` next to it.${p.os === 'darwin' ? ' They are not signed with a\nDeveloper ID and not notarized.' : ''}
 `)
   plats.push(dir)
 }
