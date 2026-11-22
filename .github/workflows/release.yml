@@ -555,10 +555,14 @@ jobs:
         with:
           name: guest-arm64
           path: ${{ runner.temp }}/guest
+      # the compiler cache of wmd build (X11): Docker builds the C program and the static ccache, Go cross-builds the wrapper
+      - name: build the arm64 compiler cache programs
+        run: |
+          bash wmd/scripts/release-part.sh ccache --arch arm64 --src wmd --out "$RUNNER_TEMP/ccache"
       - name: build wmd-linux-arm64.tar.gz and wmd-linux-arm64-musl.tar.gz
         run: |
           bash wmd/scripts/release-part.sh linux --arch arm64 --src wmd --guest "$RUNNER_TEMP/guest" --vm "$RUNNER_TEMP/vm/vm.wasm" \
-            --out "$RUNNER_TEMP/linux"
+            --ccache "$RUNNER_TEMP/ccache" --out "$RUNNER_TEMP/linux"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-arm64
@@ -623,10 +627,14 @@ jobs:
         with:
           name: guest-amd64
           path: ${{ runner.temp }}/guest
+      # the compiler cache of wmd build (X11): Docker builds the C program and the static ccache, Go cross-builds the wrapper
+      - name: build the amd64 compiler cache programs
+        run: |
+          bash wmd/scripts/release-part.sh ccache --arch x64 --src wmd --out "$RUNNER_TEMP/ccache"
       - name: build wmd-linux-x64.tar.gz and wmd-linux-x64-musl.tar.gz
         run: |
           bash wmd/scripts/release-part.sh linux --arch x64 --src wmd --guest "$RUNNER_TEMP/guest" --vm "$RUNNER_TEMP/vm/vm.wasm" \
-            --out "$RUNNER_TEMP/linux"
+            --ccache "$RUNNER_TEMP/ccache" --out "$RUNNER_TEMP/linux"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-x64
