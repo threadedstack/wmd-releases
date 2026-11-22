@@ -14,7 +14,9 @@
 #
 # plan decides the version and what to rebuild (scripts/release-plan.sh); the build jobs take an unchanged part from the
 # last release, checked against its SHA256SUMS.txt (scripts/release-reuse.sh), or build it (scripts/release-part.sh);
-# assemble packs the web package and the release (scripts/release.sh --prebuilt) and runs the release checks; proof
+# edge builds wmd's own browser runtime (edge/browser, Rust to WebAssembly; the page option edge=1) and fetches Edge.js's
+# node core (edgejs.wasm, pinned by the Makefile's EDGEJS_SHA256) for the web package; assemble packs the web package with
+# both and the release (scripts/release.sh --prebuilt) and runs the release checks; proof
 # runs the Linux proof on arm64 and x64; publish tags wmd and publishes exactly the checked files; relay deploys the
 # relay when its code changed; on-failure opens an issue on threadedstack/wmd (not for a dry run), and deletes the run's
 # artifacts except the release artifact of a publish that failed or was cancelled after it started (SETUP.md uses it
@@ -406,6 +408,53 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # The files the web package holds for the page option edge=1 (scripts/web-release.py: edge-site/own and edge-site/wasm).
+  # The runtime is built from this commit with the nightly of edge/browser/rust-toolchain.toml and the wasm-bindgen of its
+  # Cargo.lock (build.sh installs it), online (a runner has no cargo registry cache), and its crates' licences are checked.
+  # Edge.js's node core is not built here (scripts/rebuild-edgejs.sh needs macOS and wasixcc): the build pinned by
+  # EDGEJS_SHA256 is a file of the edge-modules release of this repository (release/SETUP.md says how it is put there).
+  edge:
+    needs: plan
+    if: needs.plan.outputs.go == '1'
+    runs-on: ubuntu-24.04
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-give-way.sh
+      - name: Edge.js's node core (edgejs.wasm of the edge-modules release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash wmd/scripts/release-part.sh edgejs --src wmd --repo "$GITHUB_REPOSITORY" --out "$RUNNER_TEMP/edge"
+      - name: the pinned Rust nightly of edge/browser
+        run: |
+          channel=$(sed -n 's/^channel = "\(nightly-[0-9-]*\)"$/\1/p' wmd/edge/browser/rust-toolchain.toml)
+          [ -n "$channel" ] || { echo "edge/browser/rust-toolchain.toml names no nightly"; exit 1; }
+          rustup toolchain install "$channel" --profile minimal --component rust-src --target wasm32-unknown-unknown
+      - name: build the browser runtime (edge/browser)
+        run: bash wmd/scripts/release-part.sh edge-browser --src wmd --out "$RUNNER_TEMP/edge"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: edge
+          path: ${{ runner.temp }}/edge/
+          if-no-files-found: error
+          retention-days: 1
+
   mac:
     needs: plan
     if: needs.plan.outputs.go == '1'
@@ -605,7 +654,7 @@ jobs:
           retention-days: 1
 
   assemble:
-    needs: [plan, mac, vm, guest-arm64, linux-arm64, linux-x64]
+    needs: [plan, mac, vm, guest-arm64, edge, linux-arm64, linux-x64]
     runs-on: ubuntu-24.04
     env:
       TAG: ${{ needs.plan.outputs.tag }}
@@ -683,6 +732,10 @@ jobs:
           path: ${{ runner.temp }}/pre
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          name: edge
+          path: ${{ runner.temp }}/edge
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
           name: builder-arm64
           path: ${{ runner.temp }}/builder
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -692,7 +745,8 @@ jobs:
       - name: pack the web package with both builder images
         run: |
           bash wmd/scripts/release-part.sh web --src wmd --vm "$RUNNER_TEMP/pre/vm.wasm" --guest "$RUNNER_TEMP/pre" \
-            --builder "$RUNNER_TEMP/builder" --out "$RUNNER_TEMP/web"
+            --builder "$RUNNER_TEMP/builder" --edge-own "$RUNNER_TEMP/edge/edge-browser" --edge-wasm "$RUNNER_TEMP/edge/edgejs.wasm" \
+            --out "$RUNNER_TEMP/web"
           cp "$RUNNER_TEMP"/web/wmd-web-*.tgz "$RUNNER_TEMP"/web/wmd-web-*-builder-*.tar "$RUNNER_TEMP/pre/"
       - name: assemble the release
         run: |
@@ -915,7 +969,7 @@ jobs:
             while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"; done
 
   on-failure:
-    needs: [plan, vm, guest-arm64, guest-amd64, mac, linux-arm64, linux-x64, assemble, proof, publish, relay, discard]
+    needs: [plan, vm, guest-arm64, guest-amd64, edge, mac, linux-arm64, linux-x64, assemble, proof, publish, relay, discard]
     # cancelled(): a run that gave way still deletes its artifacts; only failed jobs open the issue
     if: failure() || cancelled()
     runs-on: ubuntu-24.04
