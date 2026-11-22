@@ -411,8 +411,9 @@ jobs:
   # The files the web package holds for the page option edge=1 (scripts/web-release.py: edge-site/own and edge-site/wasm).
   # The runtime is built from this commit with the nightly of edge/browser/rust-toolchain.toml and the wasm-bindgen of its
   # Cargo.lock (build.sh installs it), online (a runner has no cargo registry cache), and its crates' licences are checked.
-  # Edge.js's node core is not built here (scripts/rebuild-edgejs.sh needs macOS and wasixcc): the build pinned by
-  # EDGEJS_SHA256 is a file of the edge-modules release of this repository (release/SETUP.md says how it is put there).
+  # Edge.js's node core is not built here (a long build with a pinned result): the build pinned by EDGEJS_SHA256 is a
+  # file of the edge-modules release of this repository, put there by the edge-modules workflow
+  # (release/edge-modules.yml, which builds it on runners; release/SETUP.md).
   edge:
     needs: plan
     if: needs.plan.outputs.go == '1'
