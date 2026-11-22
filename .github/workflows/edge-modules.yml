@@ -8,10 +8,12 @@
 # `gh workflow run edge-modules.yml -R threadedstack/wmd-releases -f sha=<full sha> [-f major=22]` builds the module of
 # that wmd commit twice, on two runners and in two different folders (scripts/rebuild-edgejs.sh with the pinned wasixcc,
 # LLVM, sysroot and wasm-opt), and fails when the two files differ, when one names a folder of its runner, or when one
-# holds the text "/Users/". The run's summary gives the sha256 to pin. With `-f publish=true` the file must also be the
-# one the commit's Makefile pins; it is then put into the edge-modules release as edgejs-<sha256>.wasm (for node 24 with
-# the commit's edge/edgejs.NOTICES.txt, which must name the same sha256), where the release run takes it
-# (scripts/release-part.sh edgejs).
+# holds the text "/Users/". The run's summary gives the sha256 to pin. With `-f publish=true` (node 24 only) the file must
+# also be the one the commit's Makefile pins; it is then put into the edge-modules release as edgejs-<sha256>.wasm with
+# the commit's edge/edgejs.NOTICES.txt, which must name the same sha256, where the release run takes it
+# (scripts/release-part.sh edgejs). The modules of node 22 and node 20 are in no release (make edge builds them on a
+# developer's machine against the pin) and have no notices file: they are pinned from a run without publish and are
+# never made public.
 #
 # So a new pin takes two runs: one without publish at the commit that changes the build, which prints the sha256; then,
 # with that sha256 pinned (and the notices written again), one with publish at the pinning commit.
@@ -174,16 +176,16 @@ jobs:
           PINNED: ${{ steps.same.outputs.pinned }}
         run: |
           [ "$PINNED" = 1 ] || { echo "not published: the module is not the one the commit's Makefile pins"; exit 1; }
+          # only the node 24 module is in a release, and only it has a notices file: a module of another major is pinned from
+          # a run without publish and never made public
+          [ "$MAJOR" = 24 ] || { echo "not published: no release holds the node $MAJOR module and it has no notices file" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
           up="$RUNNER_TEMP/up"; mkdir -p "$up"
           cp "$RUNNER_TEMP/in/edgejs-a/edgejs.wasm" "$up/edgejs-$SUM.wasm"
-          files=("$up/edgejs-$SUM.wasm")
-          if [ "$MAJOR" = 24 ]; then
-            # the notices of the node 24 module name its sha256 on their second line (scripts/edgejs-notices.py)
-            [ "$(sed -n 2p wmd/edge/edgejs.NOTICES.txt)" = "edgejs.wasm sha256: $SUM" ] ||
-              { echo "edge/edgejs.NOTICES.txt of the commit names another module"; exit 1; }
-            cp wmd/edge/edgejs.NOTICES.txt "$up/edgejs-$SUM.NOTICES.txt"
-            files+=("$up/edgejs-$SUM.NOTICES.txt")
-          fi
+          # the notices of the module name its sha256 on their second line (scripts/edgejs-notices.py)
+          [ "$(sed -n 2p wmd/edge/edgejs.NOTICES.txt)" = "edgejs.wasm sha256: $SUM" ] ||
+            { echo "edge/edgejs.NOTICES.txt of the commit names another module"; exit 1; }
+          cp wmd/edge/edgejs.NOTICES.txt "$up/edgejs-$SUM.NOTICES.txt"
+          files=("$up/edgejs-$SUM.wasm" "$up/edgejs-$SUM.NOTICES.txt")
           gh release view edge-modules -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
             gh release create edge-modules -R "$GITHUB_REPOSITORY" --prerelease --latest=false --title "edge-modules" \
               --notes "Edge.js node core builds that the web package holds (scripts/release-part.sh edgejs). Not a wmd release."
