@@ -1,0 +1,281 @@
+# Builds the Wasm twin of one Go release's compiler (compile-<version>.wasm) for wmd's browser machine. Installed as
+# .github/workflows/gowasm.yml of threadedstack/wmd-releases (source: release/gowasm.yml of threadedstack/wmd).
+#
+# The twin is Go's own `compile` built for wasip1/wasm (scripts/gowasm/build-twin.sh, docs/gowasm-twin.md). One file per Go
+# release, about 41 MB. The page option gowasm=1 hands each `go build` compile of a known release to it. The files are pinned by
+# sha256 in web/src/gowasm/pins.json; this workflow is where a pinned file comes from. No developer's machine builds one that
+# is put up.
+#
+# `gh workflow run gowasm.yml -R threadedstack/wmd-releases -f sha=<full sha> -f version=1.25.14` runs, for that release and that
+# wmd commit:
+#   build   the twin twice, on two runners of two architectures (ubuntu-24.04 and ubuntu-24.04-arm), each in its own folder;
+#   check   scripts/gowasm/check-twin.sh for arm64 on the arm runner and for amd64 on the x64 runner: every compile of one
+#           build gives the same object bytes from the twin as from the release's own compiler;
+#   collect it fails when the two twins differ, when one (or a notices file or twin json) names a folder of its runner, or
+#           when a check did not pass; it makes the table entries (make-table.mjs) and prints the pins entry (the summary).
+# With `-f publish=true` the files must also be the ones the commit pins (web/src/gowasm/pins.json): compile-<v>.wasm, its
+# .sha256, twin-<v>.json and compile-<v>.NOTICES.txt (Go's LICENSE and PATENTS) go into the release gowasm-modules, and nothing
+# else does (scripts/gowasm/pins.mjs gate).
+#
+# A new Go patch release takes two runs: one without publish (prints the pins entry), then, with that entry pinned
+# (`node scripts/gowasm/pins.mjs entry <v> <folder> --into web/src/gowasm/pins.json`, see release/SETUP.md), one with publish at
+# the pinning commit.
+#
+# Third-party actions are pinned by commit (the tag in the comment); checkout follows release.yml. The runner's bun and wasmtime
+# are the pinned files of scripts/gowasm/ci-tools.sh (sha256 checked before anything is unpacked).
+# Secrets: RELEASE_APP_CLIENT_ID and RELEASE_APP_KEY (the release GitHub App, to read threadedstack/wmd).
+name: gowasm
+run-name: gowasm ${{ inputs.version }} ${{ inputs.sha }} (${{ inputs.publish && 'publish' || 'dry run' }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: full commit sha of threadedstack/wmd
+        required: true
+        type: string
+      version:
+        description: Go release, three numbers (for example 1.25.14)
+        required: true
+        type: string
+      publish:
+        description: put the twin into the gowasm-modules release (it must be the one the commit's web/src/gowasm/pins.json pins)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gowasm-${{ inputs.version }}-${{ inputs.publish && 'publish' || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SHA: ${{ inputs.sha }}
+  VERSION: ${{ inputs.version }}
+  PUBLISH: ${{ inputs.publish }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      pinned: ${{ steps.pins.outputs.pinned }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ inputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - name: the commit's pins for this Go release
+        id: pins
+        run: |
+          rc=0
+          out=$(node wmd/scripts/gowasm/pins.mjs show "$VERSION") || rc=$?
+          [ "$rc" = 0 ] || [ "$rc" = 3 ] || { echo "'$VERSION' is not a Go release x.y.z"; exit 1; }
+          echo "$out" >> "$GITHUB_OUTPUT"
+          if [ "$rc" = 3 ]; then
+            echo "Go $VERSION is not pinned by ${SHA:0:9}: the run prints the pins entry to add." | tee -a "$GITHUB_STEP_SUMMARY"
+            [ "$PUBLISH" != true ] || { echo "not published: the commit does not pin Go $VERSION"; exit 1; }
+          else
+            echo "Go $VERSION is pinned by ${SHA:0:9}:" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "$out" | grep -E '^(twin|notices)_' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        # the same build twice, on two architectures, each in a folder named after its letter
+        include:
+          - copy: a
+            runner: ubuntu-24.04
+          - copy: b
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ inputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - name: build the twin (scripts/gowasm/build-twin.sh)
+        run: |
+          bash wmd/scripts/gowasm/build-twin.sh "$VERSION" "$RUNNER_TEMP/build-${{ matrix.copy }}"
+      - name: the files name no folder of this runner
+        run: |
+          d="$RUNNER_TEMP/build-${{ matrix.copy }}"
+          up="$RUNNER_TEMP/up"; mkdir -p "$up"
+          bad=0
+          for f in "compile-$VERSION.wasm" "compile-$VERSION.NOTICES.txt" "twin-$VERSION.json" "flags-$VERSION.txt"; do
+            echo "-- $f"
+            node wmd/scripts/gowasm/pins.mjs scan "$d/$f" /Users/ "$HOME" "$RUNNER_TEMP" "$GITHUB_WORKSPACE" /home/runner /private/var/ || bad=1
+          done
+          [ "$bad" = 0 ] || { echo "a twin file names a folder of the machine that built it"; exit 1; }
+          for f in "compile-$VERSION.wasm" "compile-$VERSION.wasm.sha256" "compile-$VERSION.NOTICES.txt" "twin-$VERSION.json" "flags-$VERSION.txt"; do
+            cp "$d/$f" "$up/$f"
+          done
+          sum=$(sha256sum "$up/compile-$VERSION.wasm" | cut -c1-64)
+          echo "copy ${{ matrix.copy }} (${{ matrix.runner }}): sha256 $sum, $(wc -c < "$up/compile-$VERSION.wasm" | tr -d ' ') bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gowasm-${{ matrix.copy }}
+          path: ${{ runner.temp }}/up
+          if-no-files-found: error
+          retention-days: 3
+
+  check:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ inputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gowasm-a
+          path: ${{ runner.temp }}/in
+      - name: the pinned bun and wasmtime
+        run: |
+          bash wmd/scripts/gowasm/ci-tools.sh "$RUNNER_TEMP/tools"
+          echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
+      - name: every compile of one build is the same object in the twin (scripts/gowasm/check-twin.sh)
+        run: |
+          bun --version; wasmtime --version
+          bash wmd/scripts/gowasm/check-twin.sh "$VERSION" "${{ matrix.arch }}" --out "$RUNNER_TEMP/in"
+          mkdir -p "$RUNNER_TEMP/chk"
+          cp "$RUNNER_TEMP/in/check-$VERSION-${{ matrix.arch }}.json" "$RUNNER_TEMP/in/check-$VERSION-${{ matrix.arch }}.tsv" "$RUNNER_TEMP/chk/"
+          python3 -I - "$RUNNER_TEMP/chk/check-$VERSION-${{ matrix.arch }}.json" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          c = json.load(open(sys.argv[1]))
+          print(f"check {c['version']} {c['arch']}: passed={c['passed']}, {c['identical']} of {c['referenceCompiles']} compiles identical")
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gowasm-check-${{ matrix.arch }}
+          path: ${{ runner.temp }}/chk
+          if-no-files-found: error
+          retention-days: 3
+
+  collect:
+    needs: [plan, build, check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ inputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/in
+      - name: the pinned bun
+        run: |
+          bash wmd/scripts/gowasm/ci-tools.sh "$RUNNER_TEMP/tools"
+          echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
+      - name: the two twins are the same file
+        run: |
+          a="$RUNNER_TEMP/in/gowasm-a"; b="$RUNNER_TEMP/in/gowasm-b"
+          for f in "compile-$VERSION.wasm" "compile-$VERSION.NOTICES.txt"; do
+            sa=$(sha256sum "$a/$f" | cut -c1-64); sb=$(sha256sum "$b/$f" | cut -c1-64)
+            echo "$f: a $sa, b $sb"
+            [ "$sa" = "$sb" ] || { echo "$f differs between the two runners: the build is not reproducible" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          done
+          # the guest compiles (the table's keys) are the same on both runners; the rest of twin-<v>.json names the host's toolchain
+          ga=$(python3 -I -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["guest"], sort_keys=True))' "$a/twin-$VERSION.json")
+          gb=$(python3 -I -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["guest"], sort_keys=True))' "$b/twin-$VERSION.json")
+          [ "$ga" = "$gb" ] || { echo "the guest compiles differ between the two runners" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          echo "Go $VERSION: both builds give $(sha256sum "$a/compile-$VERSION.wasm" | cut -c1-64)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: the table entries (scripts/gowasm/make-table.mjs) and the pins entry
+        run: |
+          fold="$RUNNER_TEMP/fold"; mkdir -p "$fold"
+          cp "$RUNNER_TEMP/in/gowasm-a/"* "$fold/"
+          cp "$RUNNER_TEMP/in/gowasm-check-arm64/"* "$RUNNER_TEMP/in/gowasm-check-amd64/"* "$fold/"
+          bun wmd/scripts/gowasm/make-table.mjs "$fold" "$VERSION" || { echo "make-table left an entry out: a check did not pass" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          rc=0
+          node wmd/scripts/gowasm/pins.mjs entry "$VERSION" "$fold" --check > "$RUNNER_TEMP/entry.json" || rc=$?
+          case $rc in
+            0) echo "It is the commit's pin." | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            3)
+              { echo "The commit does not pin Go $VERSION. The pins entry (add it with scripts/gowasm/pins.mjs entry $VERSION <folder> --into web/src/gowasm/pins.json):"
+                echo '```json'; cat "$RUNNER_TEMP/entry.json"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+              [ "$PUBLISH" != true ] || exit 1 ;;
+            *) echo "The built release is not the one the commit pins." | tee -a "$GITHUB_STEP_SUMMARY"; exit 1 ;;
+          esac
+      - name: put the pinned files into the gowasm-modules release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # exactly the four files the commit pins go up: the gate refuses a missing, another or extra file
+          pub="$RUNNER_TEMP/pub"; mkdir -p "$pub"
+          for f in "compile-$VERSION.wasm" "compile-$VERSION.wasm.sha256" "compile-$VERSION.NOTICES.txt" "twin-$VERSION.json"; do cp "$RUNNER_TEMP/in/gowasm-a/$f" "$pub/$f"; done
+          node wmd/scripts/gowasm/pins.mjs gate "$VERSION" "$pub" > "$RUNNER_TEMP/upload.txt" || { echo "not published: a file is not the one the commit pins"; exit 1; }
+          files=()
+          while IFS= read -r line; do files+=("$pub/${line#upload=}"); done < "$RUNNER_TEMP/upload.txt"
+          [ "${#files[@]}" = 4 ] || { echo "not published: the gate lists ${#files[@]} files, not 4"; exit 1; }
+          gh release view gowasm-modules -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create gowasm-modules -R "$GITHUB_REPOSITORY" --prerelease --latest=false --title "gowasm-modules" \
+              --notes "Wasm twins of Go's compiler for the wmd-web package (web/src/gowasm/fetch-twin.mjs). Not a wmd release."
+          gh release upload gowasm-modules "${files[@]}" -R "$GITHUB_REPOSITORY" --clobber
+          echo "published Go $VERSION in the gowasm-modules release: ${files[*]##*/}" | tee -a "$GITHUB_STEP_SUMMARY"
