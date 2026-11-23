@@ -11,20 +11,27 @@
 # `gh workflow run python-modules.yml -R threadedstack/wmd-releases -f sha=<full sha> -f version=3.12` runs, for that
 # minor and that wmd commit:
 #   plan    scripts/python-wasix/plan.sh: the commit's pins for the minor (CPython's tag and commit id, the Makefile's
-#           sha256). A minor the commit does not pin is refused.
+#           sha256). A minor the commit does not pin is refused. scripts/python-wasix/npm-pack.mjs: the package of the
+#           minor (name, version, dist-tag) and a check that web/src/edge/python-pins.js is what the Makefile gives.
 #   build   the module twice (scripts/python-wasix/build.sh in Docker on ubuntu-24.04: the compilers of the pin are x86_64
 #           builds), each copy on its own runner; it fails when a copy names a folder of its runner (scan-module.py) or holds
 #           GNU Readline, which is GPL-3 (check-no-readline.py; the module is built with --with-readline=no), or a time of
 #           its build (check-build-time.py; the dependencies are built with the Dockerfile's SOURCE_DATE_EPOCH). The
 #           host's architecture, the architecture of each tool and the version of each Ubuntu package are kept.
 #   collect it fails when the two copies differ, and when they are not the file the Makefile pins; with `-f repin=true`
-#           it prints the sha256 to pin instead (and publishes nothing). It makes the browser's file (the module without
-#           its .debug* sections: scripts/python-wasix/strip-debug.mjs) and prints sha256 and size of both files.
+#           it prints the Makefile lines to pin instead (and publishes nothing). It checks that edge/python.NOTICES.txt is
+#           what the pins give (scripts/python-notices.py --check), makes the browser's file (the module without its
+#           .debug* sections: scripts/python-wasix/strip-debug.mjs), checks its sha256 and size against the Makefile's
+#           PYTHON_BROWSER_* pins and prints sha256 and size of both files.
+#   npm     only with `-f publish=true`: packs @threadedstack/wmd-python (the browser's file, the notices, package.json and
+#           README.md: scripts/python-wasix/npm-pack.mjs pack), checks the tarball (verify), publishes it with provenance
+#           through npm's trusted publishing (no token; this job alone may ask for the id token), and reads the registry's
+#           copy back and checks it again. The version is <full CPython version>-<revision> (3.12.14-1), the dist-tag py3.12.
+#           The owner's one step, once: `npm trust github @threadedstack/wmd-python --file python-modules.yml --repo
+#           threadedstack/wmd-releases --allow-publish` (release/SETUP.md).
 # Only the module the Makefile pins is ever made public. A minor is pinned in two runs: one with `-f repin=true` at the
 # commit that changes the build (the pins are read from the commit; the module of a Mac or of this run need not be the
 # one pinned before), then, with the printed sha256 in the Makefile, one without it.
-#
-# Not in this file yet: the notices and the npm package (publish). `publish=true` is refused until they are.
 #
 # Third-party actions are pinned by commit (the tag in the comment); checkout follows release.yml.
 # Secrets: RELEASE_APP_CLIENT_ID and RELEASE_APP_KEY (the release GitHub App, to read threadedstack/wmd).
@@ -44,7 +51,7 @@ on:
         options: ['3.12', '3.13', '3.14']
         default: '3.12'
       publish:
-        description: make the module public (not wired yet; it must be the one the commit's Makefile pins)
+        description: publish the npm package of the module (it must be the one the commit's Makefile pins)
         type: boolean
         default: false
       repin:
@@ -78,6 +85,11 @@ jobs:
       tag: ${{ steps.pins.outputs.tag }}
       commit: ${{ steps.pins.outputs.commit }}
       pin: ${{ steps.pins.outputs.pin }}
+      package: ${{ steps.package.outputs.package }}
+      package_name: ${{ steps.package.outputs.package_name }}
+      package_version: ${{ steps.package.outputs.package_version }}
+      package_tag: ${{ steps.package.outputs.package_tag }}
+      package_tgz: ${{ steps.package.outputs.package_tgz }}
     steps:
       - id: token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -97,7 +109,6 @@ jobs:
       - name: the commit's pins for this Python minor
         id: pins
         run: |
-          [ "$PUBLISH" != true ] || { echo "not published: this workflow has no publishing step yet"; exit 1; }
           [ "$PUBLISH" != true ] || [ "$REPIN" != true ] || { echo "a repin run publishes nothing"; exit 1; }
           rc=0
           out=$(bash wmd/scripts/python-wasix/plan.sh show "$VERSION") || rc=$?
@@ -112,6 +123,23 @@ jobs:
           if [ -z "$pin" ]; then
             [ "$REPIN" = true ] || { echo "the commit has no PYTHON_SHA256_$VERSION: run with repin=true to learn it" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
           fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: the package of this minor, and the pins file the page reads
+        id: package
+        run: |
+          # python-pins.js is made from the Makefile and build.sh; a stale one would put pins in the package that the Makefile does not hold
+          node wmd/scripts/python-wasix/npm-pack.mjs pins --check || { echo "web/src/edge/python-pins.js is not what the Makefile and build.sh give"; exit 1; }
+          rc=0
+          out=$(node wmd/scripts/python-wasix/npm-pack.mjs show "$VERSION") || rc=$?
+          [ "$rc" = 0 ] || [ "$rc" = 3 ] || { echo "$out"; exit 1; }
+          if [ "$rc" = 3 ] && [ "$PUBLISH" = true ]; then
+            echo "not published: the commit's pins hold no package for python $VERSION (the Makefile's PYTHON_BROWSER_* and PYTHON_REVISION lines)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "$out" >> "$GITHUB_OUTPUT"
+          echo "$out" | grep -E '^package_(version|tag)=' | tee -a "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: plan
@@ -167,6 +195,12 @@ jobs:
           epoch=$(sed -n 's/^ENV SOURCE_DATE_EPOCH=\([0-9]*\)$/\1/p' "wmd-${{ matrix.copy }}/scripts/python-wasix/Dockerfile")
           python3 -I "wmd-${{ matrix.copy }}/scripts/python-wasix/check-build-time.py" "$RUNNER_TEMP/up-${{ matrix.copy }}/python.wasm" --epoch "$epoch" ||
             { echo "python.wasm holds the time of its build: a public file must not, and two builds would differ"; exit 1; }
+      - name: sys.version says main, not the build checkout's git state
+        env:
+          COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          python3 -I "wmd-${{ matrix.copy }}/scripts/python-wasix/check-version-label.py" "$RUNNER_TEMP/up-${{ matrix.copy }}/python.wasm" --commit "$COMMIT" ||
+            { echo "python.wasm has the git state of its build checkout in sys.version: a build from the release tarball says main"; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-${{ matrix.copy }}
@@ -231,6 +265,10 @@ jobs:
             echo "The module is not the commit's pin ($PIN): run with repin=true to learn the sha256 to pin." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
+      - name: the notices are what the pins give
+        run: |
+          python3 -I wmd/scripts/python-notices.py --check ||
+            { echo "edge/python.NOTICES.txt is not what the pins of this commit give: run scripts/python-notices.py and commit the file"; exit 1; }
       - name: the browser's file (the module without its .debug sections)
         run: |
           d="$RUNNER_TEMP/collect"; mkdir -p "$d"
@@ -241,9 +279,119 @@ jobs:
           for f in python.wasm python.browser.wasm; do
             echo "$f: sha256 $(sha256sum "$d/$f" | cut -c1-64), $(wc -c < "$d/$f" | tr -d ' ') bytes" | tee -a "$GITHUB_STEP_SUMMARY"
           done
+      - name: the sizes and the browser's file are the Makefile's pins, or the lines to pin
+        env:
+          SUM: ${{ steps.same.outputs.sum }}
+        run: |
+          d="$RUNNER_TEMP/collect"
+          msz=$(wc -c < "$d/python.wasm" | tr -d ' '); bsz=$(wc -c < "$d/python.browser.wasm" | tr -d ' ')
+          bsum=$(sha256sum "$d/python.browser.wasm" | cut -c1-64)
+          if [ "$REPIN" = true ]; then
+            { echo "Lines for the Makefile (paste them, run node scripts/python-wasix/npm-pack.mjs pins --write, run python-test and scripts/python-notices.py):"
+              echo '```'
+              echo "PYTHON_SHA256_$VERSION := $SUM"
+              echo "PYTHON_SIZE_$VERSION := $msz"
+              echo "PYTHON_BROWSER_SHA256_$VERSION := $bsum"
+              echo "PYTHON_BROWSER_SIZE_$VERSION := $bsz"
+              echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            node wmd/scripts/python-wasix/npm-pack.mjs show "$VERSION" > "$RUNNER_TEMP/show.txt" || { echo "the commit pins no package for python $VERSION"; exit 1; }
+            want=$(sed -n 's/^browser_sha256=//p' "$RUNNER_TEMP/show.txt")
+            [ "$bsum" = "$want" ] || { echo "the browser's file is $bsum, the commit's PYTHON_BROWSER_SHA256_$VERSION is $want"; exit 1; }
+            [ "$msz $bsz" = "$(sed -n 's/^module_size=//p' "$RUNNER_TEMP/show.txt") $(sed -n 's/^browser_size=//p' "$RUNNER_TEMP/show.txt")" ] ||
+              { echo "the sizes of the files ($msz, $bsz) are not the commit's PYTHON_SIZE_$VERSION and PYTHON_BROWSER_SIZE_$VERSION"; exit 1; }
+            echo "The browser's file and both sizes are the commit's pins." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-collected
           path: ${{ runner.temp }}/collect
           if-no-files-found: error
           retention-days: 3
+
+  npm:
+    # this job alone may ask GitHub for the id token npm trusts; it builds nothing and takes the files from the collect job
+    needs: [plan, collect]
+    if: inputs.publish && needs.plan.outputs.package == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PKG: ${{ needs.plan.outputs.package_name }}
+      PKGV: ${{ needs.plan.outputs.package_version }}
+      PKGTAG: ${{ needs.plan.outputs.package_tag }}
+      PKGTGZ: ${{ needs.plan.outputs.package_tgz }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ inputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-collected
+          path: ${{ runner.temp }}/in
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: npm 11.5.1 or later (trusted publishing)
+        run: npm install -g npm@11.21.2 && npm --version
+      - name: pack the package and check the tarball (scripts/python-wasix/npm-pack.mjs)
+        run: |
+          # pack takes only the module and the browser's file the commit pins and the commit's notices, and refuses a file that names
+          # a folder of this runner; verify reads the tarball npm wrote: four files, no build time, nothing else
+          node wmd/scripts/python-wasix/npm-pack.mjs pack "$VERSION" "$RUNNER_TEMP/in" --out "$RUNNER_TEMP/pkg" --commit "$SHA" \
+            --work "$RUNNER_TEMP" --work "$GITHUB_WORKSPACE" --work /home/runner
+          for f in package.json README.md; do
+            python3 -I wmd/scripts/python-wasix/scan-module.py "$RUNNER_TEMP/pkg/$f" "$RUNNER_TEMP" "$GITHUB_WORKSPACE" /home/runner ||
+              { echo "$f names a folder of the runner"; exit 1; }
+          done
+          (cd "$RUNNER_TEMP/pkg" && npm pack --pack-destination "$RUNNER_TEMP")
+          node wmd/scripts/python-wasix/npm-pack.mjs verify "$VERSION" "$RUNNER_TEMP/$PKGTGZ"
+      - name: publish the version when npm does not have it
+        run: |
+          # the registry's own 0.0.0-stage and the hand placeholder 0.0.0-placeholder.0 are not versions of a module; a real one is
+          # <CPython version>-<revision>, and every later step names exactly that version (never a dist-tag)
+          case "$PKGV" in 0.0.0*) echo "$PKGV is a placeholder name, not a module version"; exit 1 ;; esac
+          spec="$PKG@$PKGV"
+          if npm view "$spec" version >/dev/null 2>&1; then
+            echo "$spec is already on npm: not published again (the next step reads it back)" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            # an upload that fails is tried again every 30 seconds for up to 30 minutes; one that reached npm anyway is not sent twice.
+            # The dist-tag is the Python minor's (py3.12), so `latest` never moves between minors.
+            start=$SECONDS
+            until npm publish "$RUNNER_TEMP/$PKGTGZ" --access public --provenance --tag "$PKGTAG"; do
+              if npm view "$spec" version --prefer-online >/dev/null 2>&1; then echo "$spec reached npm"; break; fi
+              if [ $((SECONDS - start)) -ge 1800 ]; then echo "$spec: every upload failed for 30 minutes"; exit 1; fi
+              echo "$spec: the upload failed; trying again in 30 seconds"
+              sleep 30
+            done
+            echo "published $spec" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: the registry serves the pinned package, and a page may read it
+        run: |
+          url="https://registry.npmjs.org/$PKG/-/${PKG#*/}-$PKGV.tgz"
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -fsSL --max-time 300 -o "$RUNNER_TEMP/served.tgz" "$url"; then ok=1; break; fi
+            echo "the registry does not serve $url yet"; sleep 30
+          done
+          [ "$ok" = 1 ] || { echo "the registry did not serve $url in 30 minutes"; exit 1; }
+          node wmd/scripts/python-wasix/npm-pack.mjs verify "$VERSION" "$RUNNER_TEMP/served.tgz"
+          curl -fsSI --max-time 60 -H 'Origin: https://app.example' "$url" | tr -d '\r' | grep -qix 'access-control-allow-origin: \*' ||
+            { echo "the registry sends no access-control-allow-origin: * for $url: a page cannot read it"; exit 1; }
+          echo "$url holds the pinned module of python $VERSION and a page may read it" | tee -a "$GITHUB_STEP_SUMMARY"
+          # the dist-tags after the publish: the minor's tag is on this version; `latest` is the owner's to move (release/SETUP.md)
+          npm view "$PKG" dist-tags --json | tee -a "$GITHUB_STEP_SUMMARY"
