@@ -14,7 +14,8 @@
 #           sha256). A minor the commit does not pin is refused.
 #   build   the module twice (scripts/python-wasix/build.sh in Docker on ubuntu-24.04: the compilers of the pin are x86_64
 #           builds), each copy on its own runner; it fails when a copy names a folder of its runner (scan-module.py) or holds
-#           GNU Readline, which is GPL-3 (check-no-readline.py; the module is built with --with-readline=no). The
+#           GNU Readline, which is GPL-3 (check-no-readline.py; the module is built with --with-readline=no), or a time of
+#           its build (check-build-time.py; the dependencies are built with the Dockerfile's SOURCE_DATE_EPOCH). The
 #           host's architecture, the architecture of each tool and the version of each Ubuntu package are kept.
 #   collect it fails when the two copies differ, and when they are not the file the Makefile pins; with `-f repin=true`
 #           it prints the sha256 to pin instead (and publishes nothing). It makes the browser's file (the module without
@@ -161,6 +162,11 @@ jobs:
         run: |
           python3 -I "wmd-${{ matrix.copy }}/scripts/python-wasix/check-no-readline.py" "$RUNNER_TEMP/up-${{ matrix.copy }}/python.wasm" ||
             { echo "python.wasm holds GNU Readline: the public module must be built without it"; exit 1; }
+      - name: the module holds no build time
+        run: |
+          epoch=$(sed -n 's/^ENV SOURCE_DATE_EPOCH=\([0-9]*\)$/\1/p' "wmd-${{ matrix.copy }}/scripts/python-wasix/Dockerfile")
+          python3 -I "wmd-${{ matrix.copy }}/scripts/python-wasix/check-build-time.py" "$RUNNER_TEMP/up-${{ matrix.copy }}/python.wasm" --epoch "$epoch" ||
+            { echo "python.wasm holds the time of its build: a public file must not, and two builds would differ"; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-${{ matrix.copy }}
