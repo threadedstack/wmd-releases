@@ -2,7 +2,7 @@
 // Makes the npm packages of one wmd release from that release's files (the assets of a release of
 // threadedstack/wmd-releases, as scripts/release.sh writes them), and nothing else:
 //
-//   node npm/pack.mjs --assets DIR --tag vX.Y.Z --commit SHA --out DIR
+//   node npm/pack.mjs --assets DIR --tag vX.Y.Z --commit SHA --out DIR [--node-package no]
 //
 //   @threadedstack/wmd-darwin-arm64   bin/ wmd wmdd wmd-run wmd-relay wmd-exe-stub wmd-fixtures-gen bootlock.sh
 //                                     bin/guest/arm64/ vm.wasm Image Image-4k initramfs.cpio.gz features config and the
@@ -18,17 +18,24 @@
 //   @threadedstack/wmd                the wmd, wmdd and wmd-relay commands and a small API (npm/wmd), which find the
 //                                     programs in the platform package, its optional dependency of the same version
 //   @threadedstack/wmd-web            the browser host: the wmd-web tgz's files (src/, export-page/, guest/arm64/,
-//                                     RELEASE.json), plus wmdpack.wasm (when the release has it), page/sw.js and relay/*.ts from the release
+//                                     RELEASE.json), plus wmdpack.wasm (when the release has it), page/sw.js and relay/*.ts from the release,
+//                                     and src/edge/pins.gen.js: the pins of the next package's files
+//   @threadedstack/wmd-node           node's files for the browser (X5): the web tgz's edge-site/ files (the own runtime, Edge.js's
+//                                     node core, wmd-edge's shim, their notices) at the paths the pins name. The page fetches them
+//                                     from npm by hash (web/src/edge); nobody installs this package. Its pins are written here by
+//                                     the release's own web/scripts/edge-pins.mjs, from the bytes that go into the package. A web
+//                                     tgz without edge-site/, or --node-package no (npm.yml: the name is not on npm yet), makes
+//                                     neither the package nor the pins: node then runs in the guest.
 //
 // Every package has the release's version (the tag without the v). Every file taken from DIR is checked against
 // DIR/SHA256SUMS.txt first. --out gets one npm tarball per package (npm pack) and packages.json: name, version, file,
 // sha256 and size of each, in the order to publish them (the platform package first: @threadedstack/wmd depends on it).
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SCOPE = '@threadedstack'
@@ -61,13 +68,15 @@ const sha = (f) => createHash('sha256').update(readFileSync(f)).digest('hex')
 
 function args(argv) {
   const want = ['--assets', '--tag', '--commit', '--out']
+  const may = ['--node-package']
   const a = {}
   for (let i = 0; i < argv.length; i += 2) {
-    if (!want.includes(argv[i])) fail(`unknown argument ${argv[i]} (wants ${want.join(' ')})`)
+    if (!want.includes(argv[i]) && !may.includes(argv[i])) fail(`unknown argument ${argv[i]} (wants ${want.join(' ')}, takes ${may.join(' ')})`)
     if (!argv[i + 1]) fail(`${argv[i]} needs a value`)
     a[argv[i]] = argv[i + 1]
   }
   for (const w of want) if (!a[w]) fail(`${w} is required`)
+  if (!['yes', 'no'].includes(a['--node-package'] ?? 'yes')) fail(`--node-package ${a['--node-package']} is not yes or no`)
   return a
 }
 
@@ -181,6 +190,21 @@ writeJson(join(cli, 'package.json'), {
 const web = join(work, 'wmd-web')
 execFileSync('tar', ['-xzf', asset(webTgz), '-C', work])
 renameSync(join(work, 'package'), web)
+// F4a: the web tgz holds regular files and folders only. A hard link makes a file of one folder hold the bytes of a file of another (edge-site/own/x.js is
+// src/boot.js), a symlink points out of the package: both are refused, anywhere in the tgz (tar made the hard link a second name of one file: nlink above 1).
+{
+  const walkLinks = (d) => {
+    for (const n of readdirSync(d)) {
+      const f = join(d, n)
+      const st = lstatSync(f)
+      const rel = f.slice(web.length + 1)
+      if (st.isSymbolicLink()) fail(`${webTgz} holds a symlink (${rel}); the web package has regular files only`)
+      else if (st.isDirectory()) walkLinks(f)
+      else if (st.isFile() && st.nlink > 1) fail(`${webTgz} holds a hard link (${rel}, ${st.nlink} names of one file); the web package has regular files only`)
+    }
+  }
+  walkLinks(web)
+}
 const srcDir = join(work, 'websrc')
 mkdirSync(srcDir)
 execFileSync('tar', ['-xzf', asset(webSrc), '-C', srcDir])
@@ -195,6 +219,92 @@ cpSync(join(srcWeb, 'page/sw.js'), join(web, 'page/sw.js'))
 // a release made with --wmdpack none has no converter
 const hasPack = sums.has('wmdpack.wasm')
 if (hasPack) cpSync(asset('wmdpack.wasm'), join(web, 'wmdpack.wasm'))
+if (!existsSync(join(web, 'src/edge/frame-code.gen.js'))) fail(`${webTgz} has no src/edge/frame-code.gen.js (the sandboxed frame's code, made by web/scripts/build-frame-code.mjs; scripts/web-release.py adds it)`)
+
+// F4b: text that names a folder of this machine: this run's folders as spelled and as the file system resolves them (a temp folder can be a link: /var -> /private/var),
+// the home folder, a /Users/<name>/ or /home/<name>/ path, and a Windows drive path (C:\ or C:/)
+const real = (p) => {
+  try {
+    return realpathSync(p)
+  } catch {
+    return p
+  }
+}
+const machinePaths = [...new Set([work, assets, real(work), real(assets), tmpdir(), real(tmpdir()), homedir(), real(homedir())])].filter((p) => p.length > 5 && p !== '/')
+const namesThisMachine = (text) => machinePaths.some((p) => text.includes(p)) || /\/(Users|home)\/[^/\s'"]+\//.test(text) || /(^|[^A-Za-z0-9])[A-Za-z]:[\\/]/.test(text)
+
+// node's files for the browser (X5)
+const NODE = `${SCOPE}/wmd-node`
+const pinsOut = join(web, 'src/edge/pins.gen.js')
+if (existsSync(pinsOut)) fail(`${webTgz} already has src/edge/pins.gen.js (the pins are written here, from the files of this release)`)
+const site = join(web, 'edge-site')
+let node = null
+if (existsSync(site) && a['--node-package'] !== 'no') {
+  const gen = join(srcWeb, 'scripts/edge-pins.mjs')
+  if (!existsSync(gen)) fail(`${webSrc} has no web/scripts/edge-pins.mjs (it writes the pins of node's files)`)
+  // every file of edge-site/, by its bytes: a pin finds its file by sha256 and size, whatever folder it is in
+  const have = []
+  const walk = (d) => {
+    for (const n of readdirSync(d).sort()) {
+      const f = join(d, n)
+      const st = lstatSync(f)
+      if (st.isDirectory()) walk(f)
+      else if (st.isFile()) have.push({ file: f, sha256: sha(f), size: st.size })
+      else fail(`${webTgz}: edge-site holds ${f.slice(site.length + 1)}, which is not a regular file`)
+    }
+  }
+  walk(site)
+  try {
+    execFileSync(process.execPath, [gen, '--build', join(site, 'own'), '--core', join(site, 'wasm/edgejs.wasm'), '--core-notices', join(site, 'wasm/NOTICES.txt'),
+      '--linux', join(site, 'wasm/linux.cjs'), ...(existsSync(join(site, 'wasm/linux.py')) ? ['--linux-py', join(site, 'wasm/linux.py')] : []), '--package', NODE, '--version', version, '--out', pinsOut], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (e) {
+    fail(`web/scripts/edge-pins.mjs failed on the edge-site files of ${webTgz}: ${String(e.stderr || e.message).replaceAll(work, '').trim().slice(-400)}`)
+  }
+  const text = readFileSync(pinsOut, 'utf8')
+  if (namesThisMachine(text)) fail('src/edge/pins.gen.js names a folder of this machine')
+  const pins = await import(pathToFileURL(pinsOut).href)
+  const pk = pins.EDGE_PACKAGE
+  if (!pk || pk.name !== NODE || pk.version !== version) fail(`src/edge/pins.gen.js names ${JSON.stringify(pk)}, not ${NODE}@${version}`)
+  if (!Array.isArray(pins.EDGE_PINS) || !pins.EDGE_PINS.length) fail('src/edge/pins.gen.js has no pins')
+  node = join(work, 'wmd-node')
+  const paths = []
+  for (const p of pins.EDGE_PINS) {
+    const ok = typeof p.path === 'string' && /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/.test(p.path) && !p.path.split('/').some((x) => x === '.' || x === '..')
+    if (!ok) fail(`src/edge/pins.gen.js has a pin whose path is not a plain relative path: ${JSON.stringify(p.path)}`)
+    if (['package.json', 'README.md'].includes(p.path) || paths.includes(p.path)) fail(`src/edge/pins.gen.js pins ${p.path} twice or over a file of the package`)
+    const from = have.find((h) => h.sha256 === p.sha256 && h.size === p.size)
+    if (!from) fail(`edge-site of ${webTgz} has no file with the sha256 and size of the pin ${p.path}`)
+    mkdirSync(dirname(join(node, p.path)), { recursive: true })
+    cpSync(from.file, join(node, p.path))
+    chmodSync(join(node, p.path), 0o644)
+    paths.push(p.path)
+  }
+  writeJson(join(node, 'package.json'), {
+    name: NODE,
+    ...common,
+    license: 'SEE LICENSE IN README.md',
+    description: `wmd ${version}: node's files for the browser (fetched by ${SCOPE}/wmd-web, checked by hash)`,
+    wmd: meta,
+    exports: { './*': './*', './package.json': './package.json' },
+    files: paths,
+  })
+  writeFileSync(join(node, 'README.md'), `# ${NODE}
+
+The files \`${SCOPE}/wmd-web\` ${version} needs to run a container's \`node\` on the browser's own engine (wmd commit
+\`${commit}\`). You do not install this package and you do not serve it. The page fetches it from the npm registry on first
+use, accepts each file only when it has the sha256 and size pinned inside \`${SCOPE}/wmd-web\` ${version}, and keeps it in
+the browser's cache. An app that wants its own copy serves this folder and passes its address:
+\`bootWmd({ edge: { base: '<address of this folder>' } })\`.
+
+${paths.map((p) => `- \`${p}\``).join('\n')}
+
+## Licences
+
+wmd's own code in these files is MIT. They are built from other projects, each under its own licence; the texts are in
+this package: \`NOTICES.txt\` (the crates of the runtime, \`wmd_browser_bg.wasm\` and \`wmd_browser.js\`),
+\`edgejs.NOTICES.txt\` (Edge.js's node core \`edgejs.wasm\`: Edge.js, node and what node bundles) and \`acorn/LICENSE\`.
+`)
+}
 const webPkg = JSON.parse(readFileSync(join(web, 'package.json'), 'utf8'))
 writeJson(join(web, 'package.json'), {
   name: `${SCOPE}/wmd-web`,
@@ -219,7 +329,8 @@ writeJson(join(web, 'package.json'), {
 
 // pack, in publish order
 const made = []
-for (const dir of [...plats, web, cli]) {
+// (node's files before the web package, whose pins name them)
+for (const dir of [...plats, ...(node ? [node] : []), web, cli]) {
   const [r] = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', out], {
     cwd: dir,
     encoding: 'utf8',

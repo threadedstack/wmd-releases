@@ -4,6 +4,7 @@
 # A published release starts it; `gh workflow run npm.yml -R threadedstack/wmd-releases -f tag=vX.Y.Z` runs it again
 # for one tag. It downloads the release's files, checks them against SHA256SUMS.txt, packs
 # the platform packages (@threadedstack/wmd-darwin-arm64, -linux-arm64, -linux-x64, -linux-arm64-musl, -linux-x64-musl),
+# @threadedstack/wmd-node (node's files for the browser, which @threadedstack/wmd-web pins by sha256),
 # @threadedstack/wmd-web and @threadedstack/wmd with npm/pack.mjs, installs them on a Mac with Apple silicon and runs
 # `wmd --version` from them, and publishes each version not on npm yet, the platform packages first. (Linux is proved
 # by scripts/linux-proof.sh before a release, not here.) npm trusts this workflow (trusted publishing): no npm token is stored anywhere.
@@ -27,6 +28,9 @@ concurrency:
 
 jobs:
   publish:
+    # a published release whose tag is not a version (the edge-modules release of the node core) has no packages:
+    # the run is skipped and opens no issue. A run by hand still fails on a tag that is not vX.Y.Z.
+    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v')
     runs-on: macos-15
     timeout-minutes: 180
     env:
@@ -53,7 +57,23 @@ jobs:
           [ -n "$commit" ] || { echo "the release notes name no commit"; exit 1; }
           echo "COMMIT=$commit" >> "$GITHUB_ENV"
       - name: pack
-        run: node npm/pack.mjs --assets "$RUNNER_TEMP/assets" --tag "$TAG" --commit "$COMMIT" --out "$RUNNER_TEMP/npm"
+        run: |
+          # npm lets this workflow publish a version of a package only once the package exists and names the workflow
+          # as its trusted publisher: the owner's one step (release/SETUP.md, "npm"). Until @threadedstack/wmd-node
+          # has had that step, the release is packed without it: the web package then carries no pins and node in the
+          # browser stays in the guest. Only "no such package" (E404) is read as "not yet"; any other answer of npm
+          # fails the run, so that a network fault does not publish a release without node's files.
+          node_pkg=yes
+          if ! out=$(npm view @threadedstack/wmd-node name 2>&1); then
+            if grep -q 'E404' <<<"$out"; then
+              node_pkg=no
+              echo "::warning::@threadedstack/wmd-node is not on npm: this release is packed without node's files for the browser (release/SETUP.md, npm)"
+            else
+              echo "$out"; echo "npm did not say whether @threadedstack/wmd-node exists"; exit 1
+            fi
+          fi
+          echo "NODE_PKG=$node_pkg" >> "$GITHUB_ENV"
+          node npm/pack.mjs --assets "$RUNNER_TEMP/assets" --tag "$TAG" --commit "$COMMIT" --out "$RUNNER_TEMP/npm" --node-package "$node_pkg"
       - name: install and run them
         run: |
           export RUNTIME_DIR=$RUNNER_TEMP/npm
@@ -64,11 +84,37 @@ jobs:
             const fs = require('fs'), d = process.env.RUNTIME_DIR, o = {}
             const pk = JSON.parse(fs.readFileSync(d + '/packages.json', 'utf8'))
             for (const p of pk) o[p.name] = 'file:' + d + '/' + p.file
-            const l = o['@threadedstack/wmd'], w = o['@threadedstack/wmd-web']
-            delete o['@threadedstack/wmd']; delete o['@threadedstack/wmd-web']
-            fs.writeFileSync('package.json', JSON.stringify({ name: 'try', private: true, dependencies: { '@threadedstack/wmd': l, '@threadedstack/wmd-web': w }, overrides: o }))"
+            const l = o['@threadedstack/wmd'], w = o['@threadedstack/wmd-web'], n = o['@threadedstack/wmd-node']
+            delete o['@threadedstack/wmd']; delete o['@threadedstack/wmd-web']; delete o['@threadedstack/wmd-node']
+            const deps = { '@threadedstack/wmd': l, '@threadedstack/wmd-web': w }
+            // a browser fetches node's files by itself; here the package is installed only to compare it with the pins
+            if (n) deps['@threadedstack/wmd-node'] = n
+            fs.writeFileSync('package.json', JSON.stringify({ name: 'try', private: true, dependencies: deps, overrides: o }))"
           npm install --no-audit --no-fund
-          [ "$(ls node_modules/@threadedstack | tr '\n' ' ')" = "wmd wmd-darwin-arm64 wmd-web " ] || { ls node_modules/@threadedstack; exit 1; }
+          want="wmd wmd-darwin-arm64 wmd-web "
+          [ "$NODE_PKG" = yes ] && want="wmd wmd-darwin-arm64 wmd-node wmd-web "
+          [ "$(ls node_modules/@threadedstack | LC_ALL=C sort | tr '\n' ' ')" = "$want" ] || { ls node_modules/@threadedstack; exit 1; }
+          # the web package's pins and the node package are one pair: every pinned file is in the installed node
+          # package with the pinned sha256, and the pins name this release's version. Without the node
+          # package the web package carries no pins at all.
+          NODE_PKG=$NODE_PKG VERSION=${TAG#v} node --input-type=module -e "
+            const { existsSync, readFileSync } = await import('node:fs')
+            const { createHash } = await import('node:crypto')
+            const { pathToFileURL } = await import('node:url')
+            const pins = process.cwd() + '/node_modules/@threadedstack/wmd-web/src/edge/pins.gen.js'
+            if (process.env.NODE_PKG !== 'yes') {
+              if (existsSync(pins)) throw new Error('the web package has pins but no node package was packed')
+              console.log('no node package: the web package carries no pins')
+            } else {
+              const { EDGE_PACKAGE, EDGE_PINS } = await import(pathToFileURL(pins).href)
+              if (EDGE_PACKAGE?.name !== '@threadedstack/wmd-node' || EDGE_PACKAGE.version !== process.env.VERSION) throw new Error('the pins name ' + JSON.stringify(EDGE_PACKAGE))
+              if (!Array.isArray(EDGE_PINS) || EDGE_PINS.length === 0) throw new Error('the web package has no pins')
+              for (const p of EDGE_PINS) {
+                const b = readFileSync(process.cwd() + '/node_modules/@threadedstack/wmd-node/' + p.path)
+                if (createHash('sha256').update(b).digest('hex') !== p.sha256) throw new Error('the node package does not hold the pinned ' + p.path)
+              }
+              console.log('the node package holds the ' + EDGE_PINS.length + ' pinned files of ' + EDGE_PACKAGE.name + '@' + EDGE_PACKAGE.version)
+            }"
           out=$(npx wmd --version) && echo "$out"
           [[ "$out" == *"build ${COMMIT:0:8}"* ]] || { echo "wmd --version does not name ${COMMIT:0:8}"; exit 1; }
           node --input-type=module -e "
