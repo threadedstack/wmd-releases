@@ -16,6 +16,10 @@
 # With `-f publish=true` the files must also be the ones the commit pins (web/src/gowasm/pins.json): compile-<v>.wasm, its
 # .sha256, twin-<v>.json and compile-<v>.NOTICES.txt (Go's LICENSE and PATENTS) go into the release gowasm-modules, and nothing
 # else does (scripts/gowasm/pins.mjs gate).
+#   npm     (only with publish, and only when the commit names a package for the release in web/src/gowasm/pins-data.js PACKAGES)
+#           packs the twin and its notices into that npm package (scripts/gowasm/npm-pack.mjs), checks the tarball, publishes
+#           the version when npm does not have it yet, and reads it back from the registry the way a page does. A page fetches
+#           the twin from that package. npm trusts this workflow file (trusted publishing): no npm token is stored anywhere.
 #
 # A new Go patch release takes two runs: one without publish (prints the pins entry), then, with that entry pinned
 # (`node scripts/gowasm/pins.mjs entry <v> <folder> --into web/src/gowasm/pins.json`, see release/SETUP.md), one with publish at
@@ -65,6 +69,11 @@ jobs:
     timeout-minutes: 10
     outputs:
       pinned: ${{ steps.pins.outputs.pinned }}
+      package: ${{ steps.pkg.outputs.package }}
+      package_name: ${{ steps.pkg.outputs.package_name }}
+      package_version: ${{ steps.pkg.outputs.package_version }}
+      package_tag: ${{ steps.pkg.outputs.package_tag }}
+      package_tgz: ${{ steps.pkg.outputs.package_tgz }}
     steps:
       - id: token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -95,6 +104,15 @@ jobs:
             echo "Go $VERSION is pinned by ${SHA:0:9}:" | tee -a "$GITHUB_STEP_SUMMARY"
             echo "$out" | grep -E '^(twin|notices)_' | tee -a "$GITHUB_STEP_SUMMARY"
           fi
+      - name: the commit's npm package for this Go release
+        id: pkg
+        run: |
+          rc=0
+          out=$(node wmd/scripts/gowasm/npm-pack.mjs show "$VERSION") || rc=$?
+          [ "$rc" = 0 ] || [ "$rc" = 3 ] || { echo "the commit's package entry for Go $VERSION is not usable"; exit 1; }
+          echo "$out" >> "$GITHUB_OUTPUT"
+          if [ "$rc" = 0 ]; then echo "$out" | grep -E '^package_(name|version)=' | tee -a "$GITHUB_STEP_SUMMARY"
+          else echo "${SHA:0:9} names no npm package for Go $VERSION: nothing goes to npm." | tee -a "$GITHUB_STEP_SUMMARY"; fi
 
   build:
     needs: plan
@@ -279,3 +297,85 @@ jobs:
               --notes "Wasm twins of Go's compiler for the wmd-web package (web/src/gowasm/fetch-twin.mjs). Not a wmd release."
           gh release upload gowasm-modules "${files[@]}" -R "$GITHUB_REPOSITORY" --clobber
           echo "published Go $VERSION in the gowasm-modules release: ${files[*]##*/}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  npm:
+    # this job alone may ask GitHub for the id token npm trusts; it runs no build and takes the files from the first build's folder
+    needs: [plan, collect]
+    if: inputs.publish && needs.plan.outputs.package == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PKG: ${{ needs.plan.outputs.package_name }}
+      PKGV: ${{ needs.plan.outputs.package_version }}
+      PKGTAG: ${{ needs.plan.outputs.package_tag }}
+      PKGTGZ: ${{ needs.plan.outputs.package_tgz }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmd
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: threadedstack/wmd
+          ref: ${{ inputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmd
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gowasm-a
+          path: ${{ runner.temp }}/in
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: npm 11.5.1 or later (trusted publishing)
+        run: npm install -g npm@11.21.2 && npm --version
+      - name: pack the package and check the tarball (scripts/gowasm/npm-pack.mjs)
+        run: |
+          # pack takes only the twin and the notices the commit pins; verify reads the tarball npm wrote: those two files, package.json
+          # and README.md, nothing else
+          node wmd/scripts/gowasm/npm-pack.mjs pack "$VERSION" "$RUNNER_TEMP/in" --out "$RUNNER_TEMP/pkg" --commit "$SHA"
+          for f in package.json README.md; do
+            node wmd/scripts/gowasm/pins.mjs scan "$RUNNER_TEMP/pkg/$f" "$RUNNER_TEMP" "$GITHUB_WORKSPACE" /home/runner /Users/ ||
+              { echo "$f names a folder of the runner"; exit 1; }
+          done
+          (cd "$RUNNER_TEMP/pkg" && npm pack --pack-destination "$RUNNER_TEMP")
+          node wmd/scripts/gowasm/npm-pack.mjs verify "$VERSION" "$RUNNER_TEMP/$PKGTGZ"
+      - name: publish the version when npm does not have it
+        run: |
+          spec="$PKG@$PKGV"
+          if npm view "$spec" version >/dev/null 2>&1; then
+            echo "$spec is already on npm: not published again (the next step reads it back)" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            # as npm.yml: an upload that fails is tried again every 30 seconds for up to 30 minutes; one that reached npm anyway is not
+            # sent twice. The dist-tag is the Go release's, so `latest` never moves between Go releases.
+            start=$SECONDS
+            until npm publish "$RUNNER_TEMP/$PKGTGZ" --access public --provenance --tag "$PKGTAG"; do
+              if npm view "$spec" version --prefer-online >/dev/null 2>&1; then echo "$spec reached npm"; break; fi
+              if [ $((SECONDS - start)) -ge 1800 ]; then echo "$spec: every upload failed for 30 minutes"; exit 1; fi
+              echo "$spec: the upload failed; trying again in 30 seconds"
+              sleep 30
+            done
+            echo "published $spec" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: the registry serves the pinned twin, and a page may read it
+        run: |
+          # the address the page's first source uses (web/src/gowasm/setup.js): the registry's own tarball
+          url="https://registry.npmjs.org/$PKG/-/${PKG#*/}-$PKGV.tgz"
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -fsSL --max-time 300 -o "$RUNNER_TEMP/served.tgz" "$url"; then ok=1; break; fi
+            echo "the registry does not serve $url yet"; sleep 30
+          done
+          [ "$ok" = 1 ] || { echo "the registry did not serve $url in 30 minutes"; exit 1; }
+          node wmd/scripts/gowasm/npm-pack.mjs verify "$VERSION" "$RUNNER_TEMP/served.tgz"
+          curl -fsSI --max-time 60 -H 'Origin: https://app.example' "$url" | tr -d '\r' | grep -qix 'access-control-allow-origin: \*' ||
+            { echo "the registry sends no access-control-allow-origin: * for $url: a page cannot read it"; exit 1; }
+          echo "$url holds the pinned twin of Go $VERSION and a page may read it" | tee -a "$GITHUB_STEP_SUMMARY"
