@@ -207,6 +207,25 @@ jobs:
         run: |
           # only a version tag (vX.Y.Z) is sent; the event carries the version without the v
           [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a version tag: $TAG; nothing sent"; exit 0; }
+          # the publish job saw each package with --prefer-online, but npm's cache can still answer 404 for a package for
+          # a few seconds after that (wmr 0.0.51: @threadedstack/wmd-linux-x64), so the follower is started only once a
+          # plain `npm view`, the way an install asks, finds wmd, wmd-web and every platform package of wmd; after 10
+          # minutes it is started anyway (the follower waits for the packages too)
+          v=${TAG#v}; gap=${NPM_SEEN_GAP:-15}
+          left=("@threadedstack/wmd@$v" "@threadedstack/wmd-web@$v")
+          plat=""
+          for i in $(seq 1 40); do
+            if [ -z "$plat" ]; then
+              plat=$(npm view "@threadedstack/wmd@$v" optionalDependencies --json 2>/dev/null | grep -o '"@threadedstack/[^"]*"' | tr -d '"' || true)
+              for p in $plat; do left+=("$p@$v"); done
+            fi
+            next=()
+            for s in "${left[@]}"; do npm view "$s" version >/dev/null 2>&1 || next+=("$s"); done
+            left=("${next[@]}")
+            [ ${#left[@]} -eq 0 ] && [ -n "$plat" ] && break
+            sleep "$gap"
+          done
+          for s in "${left[@]}"; do echo "::warning::$s is still not served by npm after 10 minutes; the follower is started anyway"; done
           printf '{"event_type":"wmd-release","client_payload":{"version":"%s"}}' "${TAG#v}" |
             gh api "repos/threadedstack/$REPO/dispatches" --input -
 
