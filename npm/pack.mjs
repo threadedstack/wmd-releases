@@ -314,6 +314,7 @@ writeJson(join(web, 'package.json'), {
   type: 'module',
   main: './src/boot.js',
   exports: {
+    ...webPkg.exports,
     '.': './src/boot.js',
     './src/*': './src/*',
     './relay/*': './relay/*',
