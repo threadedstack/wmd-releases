@@ -178,6 +178,38 @@ jobs:
           publish "${others[@]}"
           publish "${main[@]}"
 
+  tell-followers:
+    # #85: once the packages are on npm, the wmd followers of wmn and wmr (wmd-follow.yml of threadedstack/wmn-releases and
+    # threadedstack/wmr-releases) start at once instead of waiting for their cron. One entry per follower, each with a token for
+    # its repository alone, so one that fails does not stop the other; a failed dispatch does no harm (the follower's cron finds
+    # the version anyway).
+    needs: [publish]
+    if: success() && (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v'))
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: [wmn-releases, wmr-releases]
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+      - name: start the follower of wmd
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          REPO: ${{ matrix.repo }}
+        run: |
+          # only a version tag (vX.Y.Z) is sent; the event carries the version without the v
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a version tag: $TAG; nothing sent"; exit 0; }
+          printf '{"event_type":"wmd-release","client_payload":{"version":"%s"}}' "${TAG#v}" |
+            gh api "repos/threadedstack/$REPO/dispatches" --input -
+
   on-failure:
     needs: [publish]
     if: failure()
