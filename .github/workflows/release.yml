@@ -774,7 +774,10 @@ jobs:
         run: make -C wmd release-plan-test
       - name: zsh for the shell PATH tests (internal/service runs /bin/zsh; Ubuntu runners have none)
         if: steps.checks.outputs.go != '0'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+        # A third-party apt source that answers 403 (packages.microsoft.com, 2026-11-27) fails the update but not Ubuntu's own lists.
+        run: |
+          sudo apt-get update -qq || echo "::warning::apt-get update failed for some source; installing zsh from the lists that loaded"
+          sudo apt-get install -y -qq zsh
       - name: Go unit tests (Linux)
         if: steps.checks.outputs.go != '0'
         env:
